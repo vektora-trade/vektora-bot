@@ -10,9 +10,11 @@ Designed for self-service deployment on Railway.
 """
 
 import asyncio
+import hmac
 import json
 import logging
 import os
+import stat
 import time
 from datetime import datetime
 
@@ -54,9 +56,9 @@ FLOOR_LEVELS = {
     3.0: 1.6, 3.5: 2.1, 4.0: 2.6, 5.0: 3.5,
 }
 
-SIGNAL_SERVER_URL = os.getenv("SIGNAL_SERVER_URL", "https://signal-server-production-1802.up.railway.app")
-PROXY_URL = os.getenv("PROXY_URL", "https://crypto-signals-production-4edf.up.railway.app")
-PROXY_KEY = os.getenv("PROXY_KEY", "")
+SIGNAL_SERVER_URL = os.environ.get("SIGNAL_SERVER_URL", "")
+PROXY_URL = os.environ.get("PROXY_URL", "")
+PROXY_KEY = os.environ.get("PROXY_KEY", "")
 
 START_TIME = time.time()
 
@@ -239,7 +241,7 @@ class ClientBot:
         self.signal_api_key = signal_api_key
         self.proxy = BinanceProxy(binance_api_key, binance_secret, testnet)
 
-        # Save credentials (encrypted at rest by Railway volume)
+        # Save credentials to persistent volume
         os.makedirs(DATA_DIR, exist_ok=True)
         with open(CREDS_FILE, "w") as f:
             json.dump({
@@ -248,6 +250,7 @@ class ClientBot:
                 "signal_api_key": signal_api_key,
                 "testnet": testnet,
             }, f)
+        os.chmod(CREDS_FILE, stat.S_IRUSR | stat.S_IWUSR)
 
         # Setup leverage + margin mode
         for symbol in SYMBOLS:
@@ -685,13 +688,13 @@ app = FastAPI(title="Vektora Trading Bot", docs_url=None, redoc_url=None)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["https://vektora.trade"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
-# Setup token — first configure call sets it, subsequent calls must match
-_setup_token: str | None = None
+# Setup token — loaded from SETUP_TOKEN env var or persisted credentials
+_setup_token: str | None = os.environ.get("SETUP_TOKEN")
 
 
 from contextlib import asynccontextmanager
@@ -745,10 +748,9 @@ async def configure(request: Request):
     if not signal_api_key:
         raise HTTPException(status_code=400, detail="signal_api_key required")
 
-    # First call sets the token; subsequent calls must match
     if _setup_token is None:
-        _setup_token = token
-    elif token != _setup_token:
+        raise HTTPException(status_code=503, detail="SETUP_TOKEN env var not set")
+    if not hmac.compare_digest(token, _setup_token):
         raise HTTPException(status_code=401, detail="Invalid setup token")
 
     # Save token alongside credentials
@@ -783,7 +785,7 @@ async def status(request: Request):
     if not token:
         token = request.query_params.get("token", "")
 
-    if not _setup_token or token != _setup_token:
+    if not _setup_token or not hmac.compare_digest(token, _setup_token):
         raise HTTPException(status_code=401, detail="Invalid token")
 
     return bot.get_status()
