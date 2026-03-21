@@ -4,7 +4,7 @@ Auto-trades Binance Futures based on [Vektora](https://vektora.trade) signal ser
 
 ## Deploy to Railway
 
-[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/template/TEMPLATE_ID)
+[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/template/71c12d88-cf6d-4ad0-b0d3-6c2f0b8b75ef)
 
 ## How It Works
 
