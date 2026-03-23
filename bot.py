@@ -57,6 +57,61 @@ SIGNAL_SERVER_URL = os.environ.get("SIGNAL_SERVER_URL", "wss://signal-server-pro
 PROXY_URL = os.environ.get("PROXY_URL", "")  # fetched from signal server if empty
 PROXY_KEY = os.environ.get("PROXY_KEY", "")  # fetched from signal server if empty
 
+# Optional Telegram alerts (set both to enable)
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+
+class TelegramAlerts:
+    """Lightweight Telegram alert sender. Only active if env vars are set."""
+
+    def __init__(self):
+        self.enabled = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+        self._url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage" if self.enabled else ""
+        if self.enabled:
+            log.info("Telegram alerts enabled")
+
+    async def _send(self, text: str):
+        if not self.enabled:
+            return
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                await client.post(self._url, json={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": text,
+                    "parse_mode": "HTML",
+                })
+        except Exception as e:
+            log.warning(f"Telegram alert failed: {e}")
+
+    async def position_opened(self, symbol: str, direction: int, price: float, sl_price: float, qty: float, notional: float):
+        dir_label = "LONG" if direction == 1 else "SHORT"
+        emoji = "\U0001f7e2" if direction == 1 else "\U0001f534"
+        await self._send(
+            f"{emoji} <b>{symbol} {dir_label}</b>\n"
+            f"Entry: ${price:,.4f}\n"
+            f"SL: ${sl_price:,.4f}\n"
+            f"Size: {qty} (${notional:,.2f})"
+        )
+
+    async def position_closed(self, symbol: str, direction: int, entry_price: float, close_price: float, pnl_pct: float, pnl_dollar: float, reason: str):
+        dir_label = "LONG" if direction == 1 else "SHORT"
+        emoji = "\u2705" if pnl_pct >= 0 else "\u274C"
+        reason_label = reason.replace("_", " ").title()
+        await self._send(
+            f"{emoji} <b>{symbol} {dir_label} Closed</b>\n"
+            f"Entry: ${entry_price:,.4f} -> ${close_price:,.4f}\n"
+            f"P&L: {pnl_pct:+.2f}% (${pnl_dollar:+,.2f})\n"
+            f"Reason: {reason_label}"
+        )
+
+    async def bot_started(self, positions: int, balance: float):
+        await self._send(
+            f"\U0001f680 <b>Vektora Bot Started</b>\n"
+            f"Positions: {positions}\n"
+            f"Balance: ${balance:,.2f}"
+        )
+
 START_TIME = time.time()
 
 
@@ -233,6 +288,7 @@ class ClientBot:
         self.session_pnl = 0.0
         self.consecutive_losses: dict = {}
         self._ws_task: asyncio.Task | None = None
+        self.alerts = TelegramAlerts()
 
     # ── Setup ─────────────────────────────────────────────────
 
@@ -297,6 +353,13 @@ class ClientBot:
         self.status = "running"
         self._ws_task = asyncio.create_task(self._connect_signal_server())
         log.info("Bot started")
+
+        # Startup Telegram alert
+        try:
+            balance = await self.proxy.get_balance() if self.proxy else 0
+        except Exception:
+            balance = 0
+        await self.alerts.bot_started(len(self.positions), balance)
 
     async def _try_load_credentials(self) -> bool:
         """Load saved credentials on startup."""
@@ -477,6 +540,7 @@ class ClientBot:
             "last_floor": -1.0,
         }
         self._save_state()
+        await self.alerts.position_opened(symbol, direction, price, sl_price, qty, qty * price)
 
     async def _close_position(self, symbol: str, close_price: float, reason: str):
         """Close an existing position via the proxy."""
@@ -544,6 +608,11 @@ class ClientBot:
         )
 
         self._save_state()
+
+        # Fire-and-forget Telegram alert
+        asyncio.create_task(
+            self.alerts.position_closed(symbol, direction, entry_price, close_price, pnl_pct, pnl_dollar, reason)
+        )
 
     # ── Profit floor ratchet ──────────────────────────────────
 
