@@ -53,9 +53,9 @@ MAX_POSITIONS = 15
 MIN_HOLD_MINUTES = 60
 FLOOR_LEVELS = {}  # No floors — ride signal flips, SL as safety net only
 
-SIGNAL_SERVER_URL = os.environ.get("SIGNAL_SERVER_URL", "")
-PROXY_URL = os.environ.get("PROXY_URL", "")
-PROXY_KEY = os.environ.get("PROXY_KEY", "")
+SIGNAL_SERVER_URL = os.environ.get("SIGNAL_SERVER_URL", "wss://signal-server-production-1802.up.railway.app")
+PROXY_URL = os.environ.get("PROXY_URL", "")  # fetched from signal server if empty
+PROXY_KEY = os.environ.get("PROXY_KEY", "")  # fetched from signal server if empty
 
 START_TIME = time.time()
 
@@ -236,12 +236,37 @@ class ClientBot:
 
     # ── Setup ─────────────────────────────────────────────────
 
+    async def _fetch_proxy_config(self, signal_api_key: str):
+        """Fetch proxy URL/key from signal server using the signal API key."""
+        global PROXY_URL, PROXY_KEY
+        if PROXY_URL and PROXY_KEY:
+            return  # already set via env vars
+        http_url = SIGNAL_SERVER_URL.replace("wss://", "https://").replace("ws://", "http://")
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    f"{http_url}/api/proxy-config",
+                    params={"key": signal_api_key},
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    PROXY_URL = data["proxy_url"]
+                    PROXY_KEY = data["proxy_key"]
+                    log.info(f"Proxy config fetched from signal server")
+                else:
+                    log.error(f"Failed to fetch proxy config: {resp.status_code}")
+        except Exception as e:
+            log.error(f"Failed to fetch proxy config: {e}")
+
     async def configure(
         self, binance_api_key: str, binance_secret: str,
         signal_api_key: str, testnet: bool = False,
     ):
         """Configure and start the bot."""
         self.signal_api_key = signal_api_key
+        await self._fetch_proxy_config(signal_api_key)
+        if not PROXY_URL or not PROXY_KEY:
+            raise ValueError("Proxy config unavailable — check signal API key")
         self.proxy = BinanceProxy(binance_api_key, binance_secret, testnet)
 
         # Save credentials to persistent volume
@@ -270,13 +295,17 @@ class ClientBot:
         self._ws_task = asyncio.create_task(self._connect_signal_server())
         log.info("Bot started")
 
-    def _try_load_credentials(self) -> bool:
+    async def _try_load_credentials(self) -> bool:
         """Load saved credentials on startup."""
         try:
             if os.path.exists(CREDS_FILE):
                 with open(CREDS_FILE, "r") as f:
                     creds = json.load(f)
                 self.signal_api_key = creds["signal_api_key"]
+                await self._fetch_proxy_config(self.signal_api_key)
+                if not PROXY_URL or not PROXY_KEY:
+                    log.error("Proxy config unavailable on restart")
+                    return False
                 self.proxy = BinanceProxy(
                     creds["binance_api_key"],
                     creds["binance_secret"],
@@ -713,7 +742,7 @@ from contextlib import asynccontextmanager
 async def lifespan(_app: FastAPI):
     """Auto-start if credentials exist from a previous deploy."""
     global _setup_token
-    if bot._try_load_credentials():
+    if await bot._try_load_credentials():
         try:
             if os.path.exists(CREDS_FILE):
                 with open(CREDS_FILE, "r") as f:
