@@ -812,9 +812,23 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    """Auto-start if credentials exist from a previous deploy."""
+    """Auto-start from env vars or saved credentials."""
     global _setup_token
-    if await bot._try_load_credentials():
+
+    # Priority 1: env vars (Railway template sets these)
+    env_binance_key = os.environ.get("BINANCE_KEY", "")
+    env_binance_secret = os.environ.get("BINANCE_SECRET", "")
+    env_signal_key = os.environ.get("SIGNAL_API_KEY", "")
+
+    if env_binance_key and env_binance_secret and env_signal_key:
+        log.info("Auto-configuring from environment variables")
+        try:
+            await bot.configure(env_binance_key, env_binance_secret, env_signal_key)
+        except Exception as e:
+            log.error(f"Auto-configure from env vars failed: {e}")
+
+    # Priority 2: saved credentials from previous deploy
+    elif await bot._try_load_credentials():
         try:
             if os.path.exists(CREDS_FILE):
                 with open(CREDS_FILE, "r") as f:
@@ -823,6 +837,7 @@ async def lifespan(_app: FastAPI):
         except Exception:
             pass
         await bot._start()
+
     yield
 
 
