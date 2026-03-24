@@ -128,20 +128,27 @@ def binance_symbol(symbol: str) -> str:
     return symbol.replace("/", "")
 
 
-# Binance quantity precision per symbol (step size decimals)
-_QTY_PRECISION = {
-    "SUI/USDT": 1, "OP/USDT": 1, "SOL/USDT": 2, "ARB/USDT": 1,
-    "APT/USDT": 2, "FET/USDT": 1, "FIL/USDT": 1, "STX/USDT": 1,
-    "RUNE/USDT": 1, "THETA/USDT": 1, "BNB/USDT": 3, "ETH/USDT": 3,
-    "BTC/USDT": 3, "DOT/USDT": 1, "LINK/USDT": 2, "SAND/USDT": 0,
-    "XLM/USDT": 0, "LTC/USDT": 3,
+# Binance Futures precision per symbol: (qty_decimals, price_decimals)
+_PRECISION = {
+    "SUI/USDT": (1, 4), "OP/USDT": (1, 4), "SOL/USDT": (2, 2),
+    "ARB/USDT": (1, 4), "APT/USDT": (2, 4), "FET/USDT": (1, 4),
+    "FIL/USDT": (1, 4), "STX/USDT": (1, 4), "RUNE/USDT": (1, 4),
+    "THETA/USDT": (1, 4), "BNB/USDT": (3, 2), "ETH/USDT": (3, 2),
+    "BTC/USDT": (3, 1), "DOT/USDT": (1, 3), "LINK/USDT": (2, 3),
+    "SAND/USDT": (0, 5), "XLM/USDT": (0, 5), "LTC/USDT": (3, 2),
 }
 
 
 def _round_qty(symbol: str, qty: float) -> float:
-    """Round quantity to Binance's required precision for the symbol."""
-    decimals = _QTY_PRECISION.get(symbol, 3)
+    """Round quantity to Binance's required step size for the symbol."""
+    decimals = _PRECISION.get(symbol, (3, 4))[0]
     return round(qty, decimals)
+
+
+def _round_price(symbol: str, price: float) -> float:
+    """Round price to Binance's required tick size for the symbol."""
+    decimals = _PRECISION.get(symbol, (3, 4))[1]
+    return round(price, decimals)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -479,6 +486,7 @@ class ClientBot:
                 await self._close_position(symbol, current_price, "missed_flip")
                 sl_pct = SL_PCT / 100
                 new_sl = current_price * (1 - sl_pct) if signal_dir == 1 else current_price * (1 + sl_pct)
+                new_sl = _round_price(symbol, new_sl)
                 await self._open_position(symbol, signal_dir, current_price, new_sl)
                 continue
 
@@ -527,8 +535,9 @@ class ClientBot:
             price = fill_price
             log.info(f"  OPENED {symbol}: {side} {qty} @ ${fill_price:.4f}")
 
-            # Place SL
+            # Place SL (round to tick size)
             close_side = "SELL" if direction == 1 else "BUY"
+            sl_price = _round_price(symbol, sl_price)
             try:
                 await self.proxy.place_stop_market(symbol, close_side, qty, sl_price)
                 self.protective_orders[symbol] = {"sl_price": sl_price}
