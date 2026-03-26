@@ -261,6 +261,7 @@ class BinanceProxy:
             f"{PROXY_URL}/v1/algoOrder",
             headers=self._headers(),
             json={
+                "algoType": "CONDITIONAL",
                 "symbol": bsym,
                 "side": side.upper(),
                 "type": "STOP_MARKET",
