@@ -309,6 +309,7 @@ class ClientBot:
         self.status = "waiting_for_setup"
         self.positions: dict = {}
         self.protective_orders: dict = {}
+        self.active_symbols: list[str] = list(SYMBOLS)
         self.session_pnl = 0.0
         self.consecutive_losses: dict = {}
         self._ws_task: asyncio.Task | None = None
@@ -341,6 +342,32 @@ class ClientBot:
         except Exception as e:
             log.error(f"Failed to fetch proxy config: {e}")
 
+    async def _fetch_symbols(self):
+        """Fetch selected symbols from signal server."""
+        if not self.signal_api_key:
+            return
+        http_url = SIGNAL_SERVER_URL.replace("wss://", "https://").replace("ws://", "http://")
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    f"{http_url}/api/symbols",
+                    params={"key": self.signal_api_key},
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    self.active_symbols = data["symbols"]
+                    log.info(f"Symbol preferences loaded: {len(self.active_symbols)} of {len(data['available'])} active")
+                else:
+                    log.warning(f"Failed to fetch symbols: {resp.status_code}")
+        except Exception as e:
+            log.warning(f"Failed to fetch symbols: {e}")
+
+    async def _symbol_refresh_loop(self):
+        """Re-fetch symbol preferences every 5 minutes."""
+        while self.running:
+            await asyncio.sleep(300)
+            await self._fetch_symbols()
+
     async def configure(
         self, binance_api_key: str, binance_secret: str,
         signal_api_key: str, testnet: bool = False,
@@ -351,6 +378,7 @@ class ClientBot:
         if not PROXY_URL or not PROXY_KEY:
             raise ValueError("Proxy config unavailable — check signal API key")
         self.proxy = BinanceProxy(binance_api_key, binance_secret, testnet)
+        await self._fetch_symbols()
 
         # Save credentials to persistent volume
         os.makedirs(DATA_DIR, exist_ok=True)
@@ -377,6 +405,7 @@ class ClientBot:
         self.status = "running"
         self._ws_task = asyncio.create_task(self._connect_signal_server())
         self._status_task = asyncio.create_task(self._status_report_loop())
+        self._symbol_refresh_task = asyncio.create_task(self._symbol_refresh_loop())
         log.info("Bot started")
 
     async def _status_report_loop(self):
@@ -413,6 +442,7 @@ class ClientBot:
                     creds["binance_secret"],
                     creds.get("testnet", False),
                 )
+                await self._fetch_symbols()
                 self._load_state()
                 return True
         except Exception as e:
@@ -426,7 +456,7 @@ class ClientBot:
         raw_symbol = event["symbol"]
         symbol = normalize_symbol(raw_symbol)
 
-        if symbol not in SYMBOLS:
+        if symbol not in self.active_symbols:
             return
 
         direction = event["direction"]
@@ -652,6 +682,19 @@ class ClientBot:
             self.alerts.position_closed(symbol, direction, entry_price, close_price, pnl_pct, pnl_dollar, reason)
         )
 
+        # Report trade close to signal server (fire-and-forget)
+        try:
+            entry_time = datetime.fromisoformat(pos.get("entry_time", datetime.now().isoformat()))
+            duration = int((datetime.now() - entry_time).total_seconds())
+        except Exception:
+            duration = 0
+        asyncio.create_task(
+            self._report_trade_close(
+                symbol, direction, entry_price, close_price,
+                pnl_pct, pnl_dollar, reason, duration,
+            )
+        )
+
     # ── Profit floor ratchet ──────────────────────────────────
 
     async def _check_profit_floors(self, symbol: str, current_price: float):
@@ -737,9 +780,8 @@ class ClientBot:
         try:
             # Fetch positions directly from Binance (always accurate)
             positions = []
-            for symbol in SYMBOLS:
+            for symbol in self.active_symbols:
                 try:
-                    bsym = binance_symbol(symbol)
                     qty, direction = await self.proxy.get_position(symbol)
                     if qty > 0:
                         positions.append({
@@ -784,6 +826,33 @@ class ClientBot:
                 )
         except Exception as e:
             log.warning(f"Status report error: {e}")
+
+    async def _report_trade_close(self, symbol: str, direction: int,
+                                   entry_price: float, exit_price: float,
+                                   pnl_pct: float, pnl_usd: float,
+                                   reason: str, duration_seconds: int):
+        """Report a closed trade to signal server for analytics."""
+        if not self.signal_api_key:
+            return
+        http_url = SIGNAL_SERVER_URL.replace("wss://", "https://").replace("ws://", "http://")
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                await client.post(
+                    f"{http_url}/api/trade-close",
+                    params={"key": self.signal_api_key},
+                    json={
+                        "symbol": symbol,
+                        "direction": direction,
+                        "entry_price": entry_price,
+                        "exit_price": exit_price,
+                        "pnl_usd": round(pnl_usd, 2),
+                        "pnl_pct": round(pnl_pct, 2),
+                        "close_reason": reason,
+                        "duration_seconds": duration_seconds,
+                    },
+                )
+        except Exception as e:
+            log.warning(f"Failed to report trade close: {e}")
 
     def _get_recent_trades(self, limit: int = 20) -> list[dict]:
         """Get recent closed trades from state."""
