@@ -731,34 +731,46 @@ class ClientBot:
 
     async def _report_status(self):
         """Report bot status to signal server for the customer dashboard."""
-        if not self.signal_api_key:
+        if not self.signal_api_key or not self.proxy:
             return
         http_url = SIGNAL_SERVER_URL.replace("wss://", "https://").replace("ws://", "http://")
         try:
-            # Build positions with live P&L
+            # Fetch positions directly from Binance (always accurate)
             positions = []
-            for symbol, pos in self.positions.items():
-                positions.append({
-                    "symbol": symbol,
-                    "direction": pos["direction"],
-                    "entry_price": pos["entry_price"],
-                    "pnl_usd": 0,  # approximate — no live price here
-                    "pnl_pct": 0,
-                })
+            for symbol in SYMBOLS:
+                try:
+                    bsym = binance_symbol(symbol)
+                    qty, direction = await self.proxy.get_position(symbol)
+                    if qty > 0:
+                        positions.append({
+                            "symbol": symbol,
+                            "direction": direction,
+                            "entry_price": self.positions.get(symbol, {}).get("entry_price", 0),
+                            "pnl_usd": 0,
+                            "pnl_pct": 0,
+                        })
+                except Exception:
+                    pass
+
+            # Get total wallet balance (includes unrealized P&L)
+            balance = 0
+            try:
+                resp = await self.proxy.client.get(
+                    f"{PROXY_URL}/v1/balance", headers=self.proxy._headers()
+                )
+                if resp.status_code == 200:
+                    for asset in resp.json():
+                        if asset.get("asset") == "USDT":
+                            balance = float(asset.get("balance", 0) or 0)
+                            break
+            except Exception:
+                pass
 
             # Recent trades (last 20)
             recent = self._get_recent_trades(20)
 
-            # Get balance
-            balance = 0
-            if self.proxy:
-                try:
-                    balance = await self.proxy.get_balance()
-                except Exception:
-                    pass
-
             payload = {
-                "balance": balance,
+                "balance": round(balance, 2),
                 "positions": positions,
                 "recent_trades": recent,
                 "uptime_seconds": int(time.time() - START_TIME),
