@@ -372,11 +372,21 @@ class ClientBot:
         await self._start()
 
     async def _start(self):
-        """Start the WS connection loop."""
+        """Start the WS connection loop and status reporting."""
         self.running = True
         self.status = "running"
         self._ws_task = asyncio.create_task(self._connect_signal_server())
+        self._status_task = asyncio.create_task(self._status_report_loop())
         log.info("Bot started")
+
+    async def _status_report_loop(self):
+        """Report status to signal server every 60 seconds."""
+        while self.running:
+            await asyncio.sleep(60)
+            try:
+                await self._report_status()
+            except Exception as e:
+                log.debug(f"Status report loop error: {e}")
 
         # Startup Telegram alert
         try:
@@ -714,6 +724,68 @@ class ClientBot:
 
         pos["last_floor"] = best_lock
         self._save_state()
+
+    # ── Status reporting (for customer dashboard) ────────────
+
+    async def _report_status(self):
+        """Report bot status to signal server for the customer dashboard."""
+        if not self.signal_api_key:
+            return
+        http_url = SIGNAL_SERVER_URL.replace("wss://", "https://").replace("ws://", "http://")
+        try:
+            # Build positions with live P&L
+            positions = []
+            for symbol, pos in self.positions.items():
+                positions.append({
+                    "symbol": symbol,
+                    "direction": pos["direction"],
+                    "entry_price": pos["entry_price"],
+                    "pnl_usd": 0,  # approximate — no live price here
+                    "pnl_pct": 0,
+                })
+
+            # Recent trades (last 20)
+            recent = self._get_recent_trades(20)
+
+            # Get balance
+            balance = 0
+            if self.proxy:
+                try:
+                    balance = await self.proxy.get_balance()
+                except Exception:
+                    pass
+
+            payload = {
+                "balance": balance,
+                "positions": positions,
+                "recent_trades": recent,
+                "uptime_seconds": int(time.time() - START_TIME),
+            }
+
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                await client.post(
+                    f"{http_url}/api/bot-status",
+                    params={"key": self.signal_api_key},
+                    json=payload,
+                )
+        except Exception as e:
+            log.debug(f"Status report failed: {e}")
+
+    def _get_recent_trades(self, limit: int = 20) -> list[dict]:
+        """Get recent closed trades from state."""
+        state = self._load_state_dict()
+        trades = state.get("trades", [])
+        return trades[-limit:] if trades else []
+
+    def _load_state_dict(self) -> dict:
+        """Load raw state dict from disk."""
+        try:
+            if os.path.exists(STATE_FILE):
+                with open(STATE_FILE, "r") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return {}
 
     # ── WebSocket client ──────────────────────────────────────
 
