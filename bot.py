@@ -561,7 +561,18 @@ class ClientBot:
         self._ws_task = asyncio.create_task(self._connect_signal_server())
         self._status_task = asyncio.create_task(self._status_report_loop())
         self._symbol_refresh_task = asyncio.create_task(self._symbol_refresh_loop())
+        self._periodic_sync_task = asyncio.create_task(self._periodic_sync_loop())
         log.info("Bot started")
+
+    async def _periodic_sync_loop(self):
+        """Re-sync positions with signal server every hour as a safety net."""
+        while self.running:
+            await asyncio.sleep(3600)  # 1 hour
+            try:
+                log.info("Periodic sync: verifying positions match signal server...")
+                await self._sync_positions_with_signals()
+            except Exception as e:
+                log.warning(f"Periodic sync failed: {e}")
 
     async def _status_report_loop(self):
         """Report status to signal server every 60 seconds."""
