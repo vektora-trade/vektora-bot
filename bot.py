@@ -565,9 +565,9 @@ class ClientBot:
         log.info("Bot started")
 
     async def _periodic_sync_loop(self):
-        """Re-sync positions with signal server every hour as a safety net."""
+        """Re-sync positions with signal server every 15 minutes as a safety net."""
         while self.running:
-            await asyncio.sleep(3600)  # 1 hour
+            await asyncio.sleep(900)  # 15 minutes
             try:
                 log.info("Periodic sync: verifying positions match signal server...")
                 await self._sync_positions_with_signals()
