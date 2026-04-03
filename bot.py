@@ -50,7 +50,7 @@ LEVERAGE = 10
 SL_PCT = 8.0
 RISK_PER_TRADE_PCT = 5.0
 MAX_POSITIONS = 15
-MIN_HOLD_MINUTES = 60
+MIN_HOLD_MINUTES = 0
 FLOOR_LEVELS = {}  # No floors — ride signal flips, SL as safety net only
 
 SIGNAL_SERVER_URL = os.environ.get("SIGNAL_SERVER_URL", "wss://signal-server-production-1802.up.railway.app")
@@ -311,6 +311,7 @@ class ClientBot:
         self.protective_orders: dict = {}
         self.active_symbols: list[str] = list(SYMBOLS)
         self._syncing = False
+        self.bot_state = "running"  # running, paused_holding, paused_closed
         self.session_pnl = 0.0
         self.consecutive_losses: dict = {}
         self._ws_task: asyncio.Task | None = None
@@ -562,6 +563,7 @@ class ClientBot:
         self._status_task = asyncio.create_task(self._status_report_loop())
         self._symbol_refresh_task = asyncio.create_task(self._symbol_refresh_loop())
         self._periodic_sync_task = asyncio.create_task(self._periodic_sync_loop())
+        self._command_poll_task = asyncio.create_task(self._poll_commands())
         log.info("Bot started")
 
     async def _periodic_sync_loop(self):
@@ -573,6 +575,65 @@ class ClientBot:
                 await self._sync_positions_with_signals()
             except Exception as e:
                 log.warning(f"Periodic sync failed: {e}")
+
+    async def _poll_commands(self):
+        """Poll for pending commands every 30 seconds."""
+        http_url = SIGNAL_SERVER_URL.replace("wss://", "https://").replace("ws://", "http://")
+        while self.running:
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.get(
+                        f"{http_url}/api/commands",
+                        params={"key": self.signal_api_key},
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        if data.get("id") and data.get("command"):
+                            await self._execute_command(data["id"], data["command"])
+            except Exception as e:
+                log.error(f"Command poll failed: {e}")
+            await asyncio.sleep(30)
+
+    async def _execute_command(self, cmd_id: int, command: str):
+        """Execute a bot command."""
+        log.info(f"Executing command: {command} (id={cmd_id})")
+        try:
+            if command == "pause":
+                self.bot_state = "paused_holding"
+                log.info("Bot paused (holding positions)")
+            elif command == "pause_close_all":
+                self.bot_state = "paused_closed"
+                await self._close_all_positions()
+                log.info("Bot paused (all positions closed)")
+            elif command == "resume":
+                self.bot_state = "running"
+                log.info("Bot resumed")
+
+            # Acknowledge command
+            http_url = SIGNAL_SERVER_URL.replace("wss://", "https://").replace("ws://", "http://")
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                await client.post(
+                    f"{http_url}/api/commands/{cmd_id}/ack",
+                    params={"key": self.signal_api_key},
+                )
+        except Exception as e:
+            log.error(f"Command execution failed: {e}")
+
+    async def _close_all_positions(self):
+        """Close all open Binance positions."""
+        try:
+            for symbol in list(self.positions.keys()):
+                pos = self.positions.get(symbol)
+                if not pos:
+                    continue
+                direction = pos["direction"]
+                dir_label = "LONG" if direction == 1 else "SHORT"
+                log.info(f"Closing {symbol} ({dir_label})")
+                # Use current entry price as close price estimate;
+                # _close_position will get the actual fill price from exchange
+                await self._close_position(symbol, pos["entry_price"], "command_close_all")
+        except Exception as e:
+            log.error(f"Close all positions failed: {e}")
 
     async def _status_report_loop(self):
         """Report status to signal server every 60 seconds."""
@@ -620,6 +681,10 @@ class ClientBot:
 
     async def handle_signal(self, event: dict):
         """Handle a direction flip signal."""
+        if self.bot_state != "running":
+            log.info(f"Ignoring signal (bot state: {self.bot_state})")
+            return
+
         if self._syncing:
             return  # sync in progress, ignore signals until done
 
@@ -782,7 +847,6 @@ class ClientBot:
             "last_floor": -1.0,
         }
         self._save_state()
-        await self.alerts.position_opened(symbol, direction, price, sl_price, qty, qty * price)
         dir_label = "LONG" if direction == 1 else "SHORT"
         self._log_event("open", symbol, f"Opened {dir_label} @ ${price:,.4f}")
 
@@ -995,6 +1059,7 @@ class ClientBot:
                 "positions": positions,
                 "recent_trades": recent,
                 "uptime_seconds": int(time.time() - START_TIME),
+                "bot_state": self.bot_state,
                 "events": list(self._events),
             }
 
@@ -1135,6 +1200,7 @@ class ClientBot:
         """Return current bot status for API."""
         return {
             "status": self.status,
+            "bot_state": self.bot_state,
             "uptime_seconds": round(time.time() - START_TIME),
             "positions": len(self.positions),
             "session_pnl": round(self.session_pnl, 2),
