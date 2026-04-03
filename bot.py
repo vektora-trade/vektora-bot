@@ -312,6 +312,7 @@ class ClientBot:
         self.active_symbols: list[str] = list(SYMBOLS)
         self._syncing = False
         self.bot_state = "running"  # running, paused_holding, paused_closed
+        self.last_prices: dict[str, float] = {}
         self.session_pnl = 0.0
         self.consecutive_losses: dict = {}
         self._ws_task: asyncio.Task | None = None
@@ -733,6 +734,12 @@ class ClientBot:
 
         symbols_data = snapshot.get("symbols", {})
 
+        # Update last known prices for unrealized P&L calculation
+        for sym_key, sym_data in symbols_data.items():
+            clean_sym = sym_key.replace(":USDT", "")
+            if "price" in sym_data:
+                self.last_prices[clean_sym] = sym_data["price"]
+
         for symbol, pos in list(self.positions.items()):
             data = symbols_data.get(symbol) or symbols_data.get(f"{symbol}:USDT")
             if not data:
@@ -1027,12 +1034,25 @@ class ClientBot:
                 try:
                     qty, direction = await self.proxy.get_position(symbol)
                     if qty > 0:
+                        pos_data = self.positions.get(symbol, {})
+                        entry_price = pos_data.get("entry_price", 0)
+                        # Calculate unrealized P&L from current price
+                        pnl_usd = 0.0
+                        pnl_pct = 0.0
+                        if entry_price > 0:
+                            current_price = self.last_prices.get(symbol, entry_price)
+                            if direction == 1:
+                                pnl_pct = (current_price - entry_price) / entry_price * 100
+                            else:
+                                pnl_pct = (entry_price - current_price) / entry_price * 100
+                            notional = qty * entry_price
+                            pnl_usd = (pnl_pct / 100) * notional * LEVERAGE
                         positions.append({
                             "symbol": symbol,
                             "direction": direction,
-                            "entry_price": self.positions.get(symbol, {}).get("entry_price", 0),
-                            "pnl_usd": 0,
-                            "pnl_pct": 0,
+                            "entry_price": entry_price,
+                            "pnl_usd": round(pnl_usd, 2),
+                            "pnl_pct": round(pnl_pct, 2),
                         })
                 except Exception:
                     pass
