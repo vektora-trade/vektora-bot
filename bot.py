@@ -722,6 +722,13 @@ class ClientBot:
 
     async def _status_report_loop(self):
         """Report status to signal server every 60 seconds."""
+        # Startup Telegram alert
+        try:
+            balance = await self.proxy.get_balance() if self.proxy else 0
+        except Exception:
+            balance = 0
+        await self.alerts.bot_started(len(self.positions), balance)
+
         await asyncio.sleep(10)  # first report after 10s
         while self.running:
             try:
@@ -730,13 +737,6 @@ class ClientBot:
             except Exception as e:
                 log.warning(f"Status report failed: {e}")
             await asyncio.sleep(60)
-
-        # Startup Telegram alert
-        try:
-            balance = await self.proxy.get_balance() if self.proxy else 0
-        except Exception:
-            balance = 0
-        await self.alerts.bot_started(len(self.positions), balance)
 
     async def _try_load_credentials(self) -> bool:
         """Load saved credentials on startup."""
@@ -1178,7 +1178,7 @@ class ClientBot:
                             else:
                                 pnl_pct = (entry_price - current_price) / entry_price * 100
                             notional = qty * entry_price
-                            pnl_usd = (pnl_pct / 100) * notional * LEVERAGE
+                            pnl_usd = (pnl_pct / 100) * notional  # notional already includes leverage
                         positions.append({
                             "symbol": symbol,
                             "direction": direction,
