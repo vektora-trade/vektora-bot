@@ -22,10 +22,10 @@ import httpx
 log = logging.getLogger("bot-agent")
 
 SIGNAL_SERVER_URL = os.getenv("SIGNAL_SERVER_URL", "wss://signal-server-production-1802.up.railway.app")
-AGENT_INTERVAL_SECONDS = int(os.getenv("AGENT_INTERVAL_SECONDS", "300"))  # 5 min
+AGENT_INTERVAL_SECONDS = int(os.getenv("AGENT_INTERVAL_SECONDS", "180"))  # 3 min
 LEVERAGE = 10
 MIN_PROFIT_PCT_TO_CLOSE = 2.0  # leveraged ROI % (0.2% raw price move at 10x)
-COOLDOWN_SECONDS = 1800  # 30 min
+COOLDOWN_SECONDS = 900  # 15 min
 
 
 class BotPeakAgent:

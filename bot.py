@@ -818,6 +818,8 @@ class ClientBot:
                    self._last_snapshot_symbols.get(symbol) or {}
         adx = snap.get("adx", 50)          # default trending (safe)
         bb_w = snap.get("bb_width", 5.0)   # default wide (safe)
+        don_dir = snap.get("don_dir", 0)
+        bb_dir = snap.get("bb_dir", 0)
 
         # Decay consecutive losses after 1 hour
         if not hasattr(self, '_last_loss_ts'):
@@ -825,6 +827,18 @@ class ClientBot:
         last_loss = self._last_loss_ts.get(symbol, 0)
         if last_loss > 0 and (time.time() - last_loss) > 3600:
             self.consecutive_losses[symbol] = 0
+
+        # Track previous ADX for breakout detection
+        if not hasattr(self, '_prev_adx'):
+            self._prev_adx = {}
+        prev_adx = self._prev_adx.get(symbol, adx)
+        self._prev_adx[symbol] = adx
+
+        # Breakout override: ADX surging from consolidation + both indicators agree
+        both_agree = (don_dir == direction and bb_dir == direction)
+        breakout = prev_adx < 20 and adx > 25 and both_agree
+        if breakout:
+            log.info(f"  {symbol}: BREAKOUT OVERRIDE — ADX surged {prev_adx:.0f}→{adx:.0f}, both agree, bypassing gate")
 
         # Classify zone
         if adx > 25 and bb_w > 3.5:
@@ -834,15 +848,15 @@ class ClientBot:
         else:
             zone = "grey"
 
-        # Block logic
-        if zone == "consolidating":
+        # Block logic (breakout override bypasses the gate)
+        if zone == "consolidating" and not breakout:
             self._add_pending_flip(symbol, direction, price, sl_price, adx, bb_w, zone)
             self._log_event("whipsaw_blocked", symbol,
                 f"Flip to {dir_label} blocked — consolidating (ADX={adx:.0f}, BBW={bb_w:.1f}%)")
             log.info(f"  {symbol}: CONSOLIDATION BLOCK — ADX={adx:.0f}, BBW={bb_w:.1f}%, queued for agent")
             return
 
-        if zone == "grey" and self.consecutive_losses.get(symbol, 0) >= 2:
+        if zone == "grey" and self.consecutive_losses.get(symbol, 0) >= 2 and not breakout:
             losses = self.consecutive_losses[symbol]
             self._add_pending_flip(symbol, direction, price, sl_price, adx, bb_w, zone)
             self._log_event("whipsaw_blocked", symbol,
