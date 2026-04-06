@@ -330,6 +330,20 @@ class BotPeakAgent:
         await self._execute_pending_flips(decision, payload)
 
         actions = decision.get("actions", [])
+
+        # Hard-coded loss cut: close any position at -20% leveraged ROI
+        for pos in payload.get("positions", []):
+            if pos["unrealized_pnl_pct"] <= -20.0:
+                symbol = pos["symbol"]
+                already_included = any(a.get("symbol") == symbol for a in actions)
+                if not already_included:
+                    actions.append({
+                        "symbol": symbol,
+                        "action": "CLOSE",
+                        "reason": f"loss cut: {pos['unrealized_pnl_pct']:.1f}% leveraged ROI",
+                    })
+                    log.info(f"Bot agent: FORCED LOSS CUT {symbol} at {pos['unrealized_pnl_pct']:.1f}%")
+
         if not actions:
             log.info(f"Bot agent #{self._cycle_count}: HOLD — {decision.get('reasoning', '')[:100]}")
             return
@@ -342,9 +356,10 @@ class BotPeakAgent:
             action_type = action.get("action", "")
 
             if action_type == "CLOSE":
-                # Validate profit threshold
+                # Validate profit threshold (skip for loss cuts)
                 pos_data = next((p for p in payload["positions"] if p["symbol"] == symbol), None)
-                if pos_data and pos_data["unrealized_pnl_pct"] < MIN_PROFIT_PCT_TO_CLOSE:
+                is_loss_cut = pos_data and pos_data["unrealized_pnl_pct"] <= -20.0
+                if pos_data and not is_loss_cut and pos_data["unrealized_pnl_pct"] < MIN_PROFIT_PCT_TO_CLOSE:
                     log.warning(f"Bot agent: skipping CLOSE {symbol} — only {pos_data['unrealized_pnl_pct']:.1f}%")
                     continue
 
