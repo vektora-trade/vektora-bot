@@ -38,6 +38,7 @@ class BotPeakAgent:
         self._cycle_count: int = 0
         self._equity_history: list[float] = []  # rolling equity for slope calculation
         self._equity_ath: float = 0.0
+        self._load_agent_state()
 
     def _build_payload(self) -> dict | None:
         """Build payload from actual bot state (real positions, real prices)."""
@@ -145,6 +146,7 @@ class BotPeakAgent:
             self._equity_history = self._equity_history[-48:]
         if equity > self._equity_ath:
             self._equity_ath = equity
+            self._save_agent_state()  # persist new ATH
 
         pct_from_ath = ((equity - self._equity_ath) / self._equity_ath * 100) if self._equity_ath > 0 else 0
 
@@ -286,7 +288,13 @@ class BotPeakAgent:
                     close_price = self.bot.last_prices.get(symbol, pos["entry_price"])
                     await self.bot._close_position(symbol, close_price, "agent_approved_flip")
                 current_price = self.bot.last_prices.get(symbol, pf["signal_price"])
-                await self.bot._open_position(symbol, pf["signal_direction"], current_price, pf["sl_price"])
+                # Recalculate SL from current price (original signal SL may be stale)
+                sl_pct = 8.0 / 100  # SL_PCT
+                if pf["signal_direction"] == 1:
+                    fresh_sl = current_price * (1 - sl_pct)
+                else:
+                    fresh_sl = current_price * (1 + sl_pct)
+                await self.bot._open_position(symbol, pf["signal_direction"], current_price, fresh_sl)
                 self.bot.consecutive_losses[symbol] = 0
                 self.bot._pending_flips.pop(symbol, None)
 
@@ -434,5 +442,43 @@ class BotPeakAgent:
 
             await asyncio.sleep(AGENT_INTERVAL_SECONDS)
 
+    def _load_agent_state(self):
+        """Load ATH and equity history from bot's state file."""
+        try:
+            state_file = os.path.join(
+                os.environ.get("DATA_DIR", "/data"), "bot_state.json"
+            )
+            if os.path.exists(state_file):
+                import json
+                with open(state_file, "r") as f:
+                    state = json.load(f)
+                self._equity_ath = state.get("agent_equity_ath", 0.0)
+                self._equity_history = state.get("agent_equity_history", [])
+                self._last_action_ts = state.get("agent_last_action_ts", 0)
+                if self._equity_ath > 0:
+                    log.info(f"Bot agent: restored ATH ${self._equity_ath:.2f}")
+        except Exception as e:
+            log.warning(f"Bot agent: failed to load state: {e}")
+
+    def _save_agent_state(self):
+        """Persist ATH and equity history to bot's state file."""
+        try:
+            state_file = os.path.join(
+                os.environ.get("DATA_DIR", "/data"), "bot_state.json"
+            )
+            import json
+            state = {}
+            if os.path.exists(state_file):
+                with open(state_file, "r") as f:
+                    state = json.load(f)
+            state["agent_equity_ath"] = self._equity_ath
+            state["agent_equity_history"] = self._equity_history[-48:]
+            state["agent_last_action_ts"] = self._last_action_ts
+            with open(state_file, "w") as f:
+                json.dump(state, f, indent=2)
+        except Exception as e:
+            log.warning(f"Bot agent: failed to save state: {e}")
+
     def stop(self):
+        self._save_agent_state()
         self.running = False

@@ -715,10 +715,7 @@ class ClientBot:
             self._agent_paused = set()
         self._agent_paused.add(symbol)
         log.info(f"Peak agent: {symbol} paused until next signal flip")
-        await self.alerts.position_closed(
-            symbol, pos["direction"], pos["entry_price"], pos["entry_price"],
-            0.0, 0.0, "peak_agent"
-        )
+        # Note: Telegram alert already sent by _record_close with correct P&L
 
     async def _agent_skip_symbol(self, symbol: str, duration_minutes: int):
         """Close a position and block re-entry for N minutes (whipsaw protection)."""
@@ -930,6 +927,17 @@ class ClientBot:
                         continue
                 except (ValueError, KeyError):
                     pass
+
+                # Apply consolidation gate to missed flips too
+                adx_val = data.get("adx", 50)
+                bbw_val = data.get("bb_width", 5.0)
+                if adx_val < 20 or bbw_val < 3.0:
+                    log.info(f"  {symbol}: missed flip blocked — consolidating (ADX={adx_val:.0f}, BBW={bbw_val:.1f}%)")
+                    continue
+                if (adx_val < 25 or bbw_val < 3.5) and self.consecutive_losses.get(symbol, 0) >= 2:
+                    log.info(f"  {symbol}: missed flip blocked — grey zone + losses")
+                    continue
+
                 log.warning(f"  {symbol}: direction mismatch — closing and reopening")
                 await self._close_position(symbol, current_price, "missed_flip")
                 sl_pct = SL_PCT / 100
@@ -1030,6 +1038,11 @@ class ClientBot:
         self._save_state()
         dir_label = "LONG" if direction == 1 else "SHORT"
         self._log_event("open", symbol, f"Opened {dir_label} @ ${price:,.4f}")
+
+        # Telegram alert for position open
+        asyncio.create_task(
+            self.alerts.position_opened(symbol, direction, price, sl_price, qty, qty * price)
+        )
 
     async def _close_position(self, symbol: str, close_price: float, reason: str):
         """Close an existing position via the proxy."""
@@ -1194,24 +1207,21 @@ class ClientBot:
             f"(SL ${old_sl:.4f} -> ${new_sl:.4f})"
         )
 
-        # Place new SL before cancelling old
+        # Cancel old orders first, then place new SL (no gap in protection)
         close_side = "SELL" if direction == 1 else "BUY"
         qty = pos["qty"]
-        try:
-            await self.proxy.place_stop_market(symbol, close_side, qty, new_sl)
-        except Exception as e:
-            log.error(f"  Failed to place new SL for {symbol}: {e}")
-            return
-
-        # Cancel old orders
         await self.proxy.cancel_all_orders(symbol)
-
-        # Re-place the new SL (cancel_all removed it)
         try:
             await self.proxy.place_stop_market(symbol, close_side, qty, new_sl)
             self.protective_orders[symbol] = {"sl_price": new_sl}
         except Exception as e:
-            log.error(f"  Failed to re-place SL for {symbol} after cleanup: {e}")
+            log.error(f"  Failed to place ratcheted SL for {symbol}: {e}")
+            # Emergency: re-place old SL to maintain protection
+            try:
+                await self.proxy.place_stop_market(symbol, close_side, qty, old_sl)
+                log.info(f"  Restored old SL @ ${old_sl:.4f} for {symbol}")
+            except Exception as e2:
+                log.error(f"  CRITICAL: {symbol} has NO stop loss! {e2}")
             return
 
         pos["last_floor"] = best_lock
@@ -1233,15 +1243,15 @@ class ClientBot:
                     if qty > 0:
                         pos_data = self.positions.get(symbol, {})
                         entry_price = pos_data.get("entry_price", 0)
-                        # Calculate unrealized P&L from current price
+                        # Calculate unrealized P&L from current price (leveraged ROI)
                         pnl_usd = 0.0
                         pnl_pct = 0.0
                         if entry_price > 0:
                             current_price = self.last_prices.get(symbol, entry_price)
                             if direction == 1:
-                                pnl_pct = (current_price - entry_price) / entry_price * 100
+                                pnl_pct = (current_price - entry_price) / entry_price * 100 * LEVERAGE
                             else:
-                                pnl_pct = (entry_price - current_price) / entry_price * 100
+                                pnl_pct = (entry_price - current_price) / entry_price * 100 * LEVERAGE
                             notional = qty * entry_price
                             pnl_usd = (pnl_pct / 100) * notional  # notional already includes leverage
                         positions.append({
@@ -1394,6 +1404,9 @@ class ClientBot:
                     "protective_orders": self.protective_orders,
                     "session_pnl": self.session_pnl,
                     "consecutive_losses": self.consecutive_losses,
+                    "last_loss_ts": getattr(self, '_last_loss_ts', {}),
+                    "skip_until": {k: v for k, v in getattr(self, '_skip_until', {}).items()},
+                    "agent_paused": list(getattr(self, '_agent_paused', set())),
                     "updated": datetime.now().isoformat(),
                 }, f, indent=2)
         except Exception as e:
@@ -1407,6 +1420,16 @@ class ClientBot:
                 self.positions = state.get("positions", {})
                 self.protective_orders = state.get("protective_orders", {})
                 self.consecutive_losses = state.get("consecutive_losses", {})
+                # Restore persisted agent/gate state
+                self._last_loss_ts = state.get("last_loss_ts", {})
+                saved_skip = state.get("skip_until", {})
+                if saved_skip:
+                    now = time.time()
+                    # Only restore unexpired skips
+                    self._skip_until = {k: v for k, v in saved_skip.items() if v > now}
+                saved_paused = state.get("agent_paused", [])
+                if saved_paused:
+                    self._agent_paused = set(saved_paused)
                 for pos in self.positions.values():
                     pos.setdefault("max_pnl_pct", 0.0)
                     pos.setdefault("last_floor", -1.0)
