@@ -4,7 +4,7 @@ Vektora Client Bot — Signal Consumer + Trade Executor
 
 Connects to the Vektora signal server via WebSocket, receives Combo BB+Donchian
 direction flips, and executes Binance futures trades via the Vektora Binance proxy.
-Risk management: SL + profit floor ratchet.
+Risk management: 8% stop loss. No gate, no agent, no profit floors.
 
 Designed for self-service deployment on Railway.
 """
@@ -49,9 +49,8 @@ SYMBOLS = [
 LEVERAGE = 10
 SL_PCT = 8.0
 RISK_PER_TRADE_PCT = 5.0
-MAX_POSITIONS = 15
+MAX_POSITIONS = 5
 MIN_HOLD_MINUTES = 0
-FLOOR_LEVELS = {}  # No floors — ride signal flips, SL as safety net only
 
 SIGNAL_SERVER_URL = os.environ.get("SIGNAL_SERVER_URL", "wss://signal-server-production-1802.up.railway.app")
 PROXY_URL = os.environ.get("PROXY_URL", "")  # fetched from signal server if empty
@@ -316,12 +315,8 @@ class ClientBot:
         self.session_pnl = 0.0
         self.consecutive_losses: dict = {}
         self._ws_task: asyncio.Task | None = None
-        self._agent_task: asyncio.Task | None = None
         self.alerts = TelegramAlerts()
         self._events: list[dict] = []
-        self._last_snapshot_symbols: dict = {}  # for agent: indicator state per symbol
-        self._signal_history: list[dict] = []   # for agent: recent signal flips with timestamps
-        self._last_balance: float = 0.0         # for agent: last known wallet balance
 
     def _log_event(self, event_type: str, symbol: str, message: str):
         """Log a bot activity event for the dashboard."""
@@ -333,23 +328,6 @@ class ClientBot:
         })
         if len(self._events) > 50:
             self._events = self._events[-50:]
-
-    def _add_pending_flip(self, symbol: str, direction: int, price: float,
-                          sl_price: float, adx: float, bb_w: float, zone: str):
-        """Queue a blocked flip for AI agent evaluation."""
-        if not hasattr(self, '_pending_flips'):
-            self._pending_flips = {}
-        self._pending_flips[symbol] = {
-            "signal_direction": direction,
-            "signal_price": price,
-            "sl_price": sl_price,
-            "blocked_at": time.time(),
-            "adx": adx,
-            "bb_width": bb_w,
-            "zone": zone,
-            "consecutive_losses": self.consecutive_losses.get(symbol, 0),
-        }
-        log.info(f"  {symbol}: added to pending_flips (zone={zone}, ADX={adx:.0f}, BBW={bb_w:.1f}%)")
 
     # ── Setup ─────────────────────────────────────────────────
 
@@ -523,8 +501,6 @@ class ClientBot:
                         "entry_price": entry_est,
                         "sl_price": 0,
                         "entry_time": datetime.now().isoformat(),
-                        "max_pnl_pct": 0.0,
-                        "last_floor": -1.0,
                     }
 
             elif ex_qty > 0 and ex_dir != signal_dir:
@@ -616,7 +592,7 @@ class ClientBot:
         await self._start()
 
     async def _start(self):
-        """Start the WS connection loop, status reporting, and AI agent."""
+        """Start the WS connection loop, status reporting, and command polling."""
         self.running = True
         self.status = "running"
         self._ws_task = asyncio.create_task(self._connect_signal_server())
@@ -624,12 +600,6 @@ class ClientBot:
         self._symbol_refresh_task = asyncio.create_task(self._symbol_refresh_loop())
         self._periodic_sync_task = asyncio.create_task(self._periodic_sync_loop())
         self._command_poll_task = asyncio.create_task(self._poll_commands())
-
-        # Start AI peak agent (calls signal server for evaluation — no API key needed)
-        from bot_agent import BotPeakAgent
-        self._bot_agent = BotPeakAgent(self)
-        self._agent_task = asyncio.create_task(self._bot_agent.run())
-        log.info("AI peak agent started (server-side evaluation)")
 
         log.info("Bot started")
 
@@ -694,16 +664,6 @@ class ClientBot:
             elif command == "resume":
                 self.bot_state = "running"
                 log.info("Bot resumed")
-            elif command.startswith("close_symbol|"):
-                # Peak agent: close a specific symbol
-                symbol = normalize_symbol(command.split("|", 1)[1])
-                await self._agent_close_symbol(symbol)
-            elif command.startswith("skip_symbol|"):
-                # Peak agent: close and skip a symbol for N minutes
-                parts = command.split("|")
-                symbol = normalize_symbol(parts[1]) if len(parts) > 1 else ""
-                duration = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 30
-                await self._agent_skip_symbol(symbol, duration)
 
             # Acknowledge command
             http_url = SIGNAL_SERVER_URL.replace("wss://", "https://").replace("ws://", "http://")
@@ -730,40 +690,6 @@ class ClientBot:
                 await self._close_position(symbol, pos["entry_price"], "command_close_all")
         except Exception as e:
             log.error(f"Close all positions failed: {e}")
-
-    async def _agent_close_symbol(self, symbol: str):
-        """Close a position on behalf of the peak agent (profit-taking).
-        Blocks re-entry until next signal flip by adding to _agent_paused."""
-        pos = self.positions.get(symbol)
-        if not pos:
-            log.info(f"Peak agent close_symbol: {symbol} — no position held, ignoring")
-            return
-        dir_label = "LONG" if pos["direction"] == 1 else "SHORT"
-        log.info(f"Peak agent: closing {symbol} ({dir_label}) — profit-taking at peak")
-        await self._close_position(symbol, pos["entry_price"], "peak_agent")
-        # Block re-entry until next signal flip (mirrors engine.paused_symbols)
-        if not hasattr(self, "_agent_paused"):
-            self._agent_paused = set()
-        self._agent_paused.add(symbol)
-        log.info(f"Peak agent: {symbol} paused until next signal flip")
-        # Note: Telegram alert already sent by _record_close with correct P&L
-
-    async def _agent_skip_symbol(self, symbol: str, duration_minutes: int):
-        """Close a position and block re-entry for N minutes (whipsaw protection)."""
-        pos = self.positions.get(symbol)
-        if pos:
-            dir_label = "LONG" if pos["direction"] == 1 else "SHORT"
-            log.info(f"Peak agent: skipping {symbol} ({dir_label}) for {duration_minutes}m — whipsaw protection")
-            await self._close_position(symbol, pos["entry_price"], "peak_agent_skip")
-        else:
-            log.info(f"Peak agent skip_symbol: {symbol} — no position, blocking re-entry for {duration_minutes}m")
-
-        # Block re-entry using a time-based skip
-        skip_until = time.time() + duration_minutes * 60
-        if not hasattr(self, "_skip_until"):
-            self._skip_until = {}
-        self._skip_until[symbol] = skip_until
-        log.info(f"Peak agent: {symbol} blocked for {duration_minutes}m")
 
     async def _status_report_loop(self):
         """Report status to signal server every 60 seconds."""
@@ -810,7 +736,7 @@ class ClientBot:
     # ── Signal handling ───────────────────────────────────────
 
     async def handle_signal(self, event: dict):
-        """Handle a direction flip signal."""
+        """Handle a direction flip signal — close old position, open new."""
         if self.bot_state != "running":
             log.info(f"Ignoring signal (bot state: {self.bot_state})")
             return
@@ -831,98 +757,24 @@ class ClientBot:
 
         log.info(f"SIGNAL: {symbol} -> {dir_label} @ ${price:.4f} (SL ${sl_price:.4f})")
 
-        # Track signal for agent's whipsaw detection
-        self._signal_history.append({"symbol": symbol, "ts": time.time(), "direction": direction})
-        if len(self._signal_history) > 200:
-            self._signal_history = self._signal_history[-200:]
-
         existing = self.positions.get(symbol)
 
         if existing and existing["direction"] == direction:
             log.info(f"  Already {dir_label} on {symbol}, skipping")
             return
 
-        # ── Consolidation gate: block flips in choppy markets ──
-        snap = {}
-        if hasattr(self, '_last_snapshot_symbols'):
-            snap = self._last_snapshot_symbols.get(f"{symbol}:USDT") or \
-                   self._last_snapshot_symbols.get(symbol) or {}
-        adx = snap.get("adx", 50)          # default trending (safe)
-        bb_w = snap.get("bb_width", 5.0)   # default wide (safe)
-        don_dir = snap.get("don_dir", 0)
-        bb_dir = snap.get("bb_dir", 0)
-
-        # Decay consecutive losses after 1 hour
-        if not hasattr(self, '_last_loss_ts'):
-            self._last_loss_ts = {}
-        last_loss = self._last_loss_ts.get(symbol, 0)
-        if last_loss > 0 and (time.time() - last_loss) > 3600:
-            self.consecutive_losses[symbol] = 0
-
-        # Track previous ADX for breakout detection
-        if not hasattr(self, '_prev_adx'):
-            self._prev_adx = {}
-        prev_adx = self._prev_adx.get(symbol, adx)
-        self._prev_adx[symbol] = adx
-
-        # Breakout override: ADX surging from consolidation + both indicators agree
-        both_agree = (don_dir == direction and bb_dir == direction)
-        breakout = prev_adx < 20 and adx > 25 and both_agree
-        if breakout:
-            log.info(f"  {symbol}: BREAKOUT OVERRIDE — ADX surged {prev_adx:.0f}→{adx:.0f}, both agree, bypassing gate")
-
-        # Classify zone
-        if adx > 25 and bb_w > 3.5:
-            zone = "trending"
-        elif adx < 20 or bb_w < 3.0:
-            zone = "consolidating"
-        else:
-            zone = "grey"
-
-        # Block logic (breakout override bypasses the gate)
-        if zone == "consolidating" and not breakout:
-            self._add_pending_flip(symbol, direction, price, sl_price, adx, bb_w, zone)
-            self._log_event("whipsaw_blocked", symbol,
-                f"Flip to {dir_label} blocked — consolidating (ADX={adx:.0f}, BBW={bb_w:.1f}%)")
-            log.info(f"  {symbol}: CONSOLIDATION BLOCK — ADX={adx:.0f}, BBW={bb_w:.1f}%, queued for agent")
-            return
-
-        if zone == "grey" and self.consecutive_losses.get(symbol, 0) >= 2 and not breakout:
-            losses = self.consecutive_losses[symbol]
-            self._add_pending_flip(symbol, direction, price, sl_price, adx, bb_w, zone)
-            self._log_event("whipsaw_blocked", symbol,
-                f"Flip to {dir_label} blocked — grey zone + {losses} consecutive losses")
-            log.info(f"  {symbol}: GREY ZONE BLOCK — {losses} losses, ADX={adx:.0f}, BBW={bb_w:.1f}%, queued for agent")
-            return
-
-        # ── Trending or grey with <2 losses: execute normally ──
+        # Close existing position if flipping direction
         if existing:
             await self._close_position(symbol, price, "signal_flip")
-
-        # Check agent pause (CLOSE action — clears on signal flip)
-        if hasattr(self, "_agent_paused") and symbol in self._agent_paused:
-            self._agent_paused.discard(symbol)
-            log.info(f"  {symbol}: agent pause cleared — signal flipped, allowing re-entry")
-
-        # Check agent skip (SKIP action — time-based, ignores flips)
-        if hasattr(self, "_skip_until"):
-            skip_until = self._skip_until.get(symbol, 0)
-            if skip_until > 0 and time.time() < skip_until:
-                remaining = int((skip_until - time.time()) / 60)
-                log.info(f"  {symbol}: SKIPPED by agent — {remaining}m remaining, not opening")
-                return
 
         await self._open_position(symbol, direction, price, sl_price)
 
     async def handle_snapshot(self, snapshot: dict):
-        """Handle a 60s snapshot — check SL hits and ratchet profit floors."""
+        """Handle a 60s snapshot — check SL hits and detect missed flips."""
         if self._syncing:
             return  # sync in progress, ignore snapshots until done
 
         symbols_data = snapshot.get("symbols", {})
-
-        # Store full snapshot for agent (indicator state per symbol)
-        self._last_snapshot_symbols = symbols_data
 
         # Update last known prices for unrealized P&L calculation
         for sym_key, sym_data in symbols_data.items():
@@ -973,46 +825,17 @@ class ClientBot:
                 except (ValueError, KeyError):
                     pass
 
-                # Apply consolidation gate to missed flips too
-                adx_val = data.get("adx", 50)
-                bbw_val = data.get("bb_width", 5.0)
-                if adx_val < 20 or bbw_val < 3.0:
-                    log.info(f"  {symbol}: missed flip blocked — consolidating (ADX={adx_val:.0f}, BBW={bbw_val:.1f}%)")
-                    continue
-                if (adx_val < 25 or bbw_val < 3.5) and self.consecutive_losses.get(symbol, 0) >= 2:
-                    log.info(f"  {symbol}: missed flip blocked — grey zone + losses")
-                    continue
-
                 log.warning(f"  {symbol}: direction mismatch — closing and reopening")
                 await self._close_position(symbol, current_price, "missed_flip")
                 sl_pct = SL_PCT / 100
                 new_sl = current_price * (1 - sl_pct) if signal_dir == 1 else current_price * (1 + sl_pct)
                 new_sl = _round_price(symbol, new_sl)
                 await self._open_position(symbol, signal_dir, current_price, new_sl)
-                continue
-
-            # Profit floor ratchet
-            await self._check_profit_floors(symbol, current_price)
 
     # ── Trade execution ───────────────────────────────────────
 
     async def _open_position(self, symbol: str, direction: int, price: float, sl_price: float):
         """Open a new position via the proxy."""
-        # Check agent pause (profit-taking — clears on signal flip)
-        if hasattr(self, "_agent_paused") and symbol in self._agent_paused:
-            log.info(f"  {symbol}: blocked by peak agent (paused until next flip)")
-            return
-        # Check agent skip (whipsaw — time-based)
-        if hasattr(self, "_skip_until"):
-            skip_until = self._skip_until.get(symbol, 0)
-            if skip_until > 0 and time.time() < skip_until:
-                remaining = int((skip_until - time.time()) / 60)
-                log.info(f"  {symbol}: blocked by peak agent skip ({remaining}m remaining)")
-                return
-            elif skip_until > 0:
-                # Skip expired — clear it
-                del self._skip_until[symbol]
-
         if len(self.positions) >= MAX_POSITIONS:
             log.warning(f"  Max positions ({MAX_POSITIONS}) reached, skipping {symbol}")
             return
@@ -1077,8 +900,6 @@ class ClientBot:
             "entry_price": price,
             "sl_price": sl_price,
             "entry_time": datetime.now().isoformat(),
-            "max_pnl_pct": 0.0,
-            "last_floor": -1.0,
         }
         self._save_state()
         dir_label = "LONG" if direction == 1 else "SHORT"
@@ -1157,9 +978,6 @@ class ClientBot:
 
         if pnl_pct < 0:
             self.consecutive_losses[symbol] = self.consecutive_losses.get(symbol, 0) + 1
-            if not hasattr(self, '_last_loss_ts'):
-                self._last_loss_ts = {}
-            self._last_loss_ts[symbol] = time.time()
         else:
             self.consecutive_losses[symbol] = 0
 
@@ -1179,8 +997,6 @@ class ClientBot:
         reason_label = reason.replace("_", " ").title()
         # Map close reasons to specific event types for dashboard icons
         event_type_map = {
-            "peak_agent": "agent_close", "bot_agent_peak": "agent_close",
-            "peak_agent_skip": "agent_skip", "bot_agent_skip": "agent_skip",
             "signal_flip": "signal_flip", "missed_flip": "signal_flip",
             "external_close": "external_close",
         }
@@ -1199,78 +1015,6 @@ class ClientBot:
                 pnl_pct, pnl_dollar, reason, duration,
             )
         )
-
-    # ── Profit floor ratchet ──────────────────────────────────
-
-    async def _check_profit_floors(self, symbol: str, current_price: float):
-        """Check and ratchet profit floor for a position."""
-        pos = self.positions.get(symbol)
-        if not pos or not self.proxy:
-            return
-
-        entry_price = pos["entry_price"]
-        direction = pos["direction"]
-        if entry_price <= 0:
-            return
-
-        if direction == 1:
-            pnl_pct = (current_price - entry_price) / entry_price * 100
-        else:
-            pnl_pct = (entry_price - current_price) / entry_price * 100
-
-        max_pnl = max(pos.get("max_pnl_pct", 0.0), pnl_pct)
-        pos["max_pnl_pct"] = max_pnl
-
-        last_floor = pos.get("last_floor", -1.0)
-        best_lock = -1.0
-        for threshold in sorted(FLOOR_LEVELS.keys()):
-            if max_pnl >= threshold:
-                best_lock = FLOOR_LEVELS[threshold]
-
-        if best_lock <= last_floor:
-            return
-
-        if direction == 1:
-            new_sl = entry_price * (1 + best_lock / 100)
-        else:
-            new_sl = entry_price * (1 - best_lock / 100)
-
-        old_sl = self.protective_orders.get(symbol, {}).get("sl_price", 0)
-
-        should_move = False
-        if direction == 1 and new_sl > old_sl:
-            should_move = True
-        elif direction == -1 and (old_sl == 0 or new_sl < old_sl):
-            should_move = True
-
-        if not should_move:
-            return
-
-        lock_label = f"+{best_lock:.1f}%" if best_lock > 0 else "breakeven"
-        log.info(
-            f"  FLOOR RATCHET {symbol}: peak +{max_pnl:.1f}% -> lock {lock_label} "
-            f"(SL ${old_sl:.4f} -> ${new_sl:.4f})"
-        )
-
-        # Cancel old orders first, then place new SL (no gap in protection)
-        close_side = "SELL" if direction == 1 else "BUY"
-        qty = pos["qty"]
-        await self.proxy.cancel_all_orders(symbol)
-        try:
-            await self.proxy.place_stop_market(symbol, close_side, qty, new_sl)
-            self.protective_orders[symbol] = {"sl_price": new_sl}
-        except Exception as e:
-            log.error(f"  Failed to place ratcheted SL for {symbol}: {e}")
-            # Emergency: re-place old SL to maintain protection
-            try:
-                await self.proxy.place_stop_market(symbol, close_side, qty, old_sl)
-                log.info(f"  Restored old SL @ ${old_sl:.4f} for {symbol}")
-            except Exception as e2:
-                log.error(f"  CRITICAL: {symbol} has NO stop loss! {e2}")
-            return
-
-        pos["last_floor"] = best_lock
-        self._save_state()
 
     # ── Status reporting (for customer dashboard) ────────────
 
@@ -1322,9 +1066,6 @@ class ClientBot:
                             break
             except Exception:
                 pass
-            # Store for agent
-            if balance > 0:
-                self._last_balance = balance
 
             # Recent trades (last 20)
             recent = self._get_recent_trades(20)
@@ -1449,9 +1190,6 @@ class ClientBot:
                     "protective_orders": self.protective_orders,
                     "session_pnl": self.session_pnl,
                     "consecutive_losses": self.consecutive_losses,
-                    "last_loss_ts": getattr(self, '_last_loss_ts', {}),
-                    "skip_until": {k: v for k, v in getattr(self, '_skip_until', {}).items()},
-                    "agent_paused": list(getattr(self, '_agent_paused', set())),
                     "updated": datetime.now().isoformat(),
                 }, f, indent=2)
         except Exception as e:
@@ -1465,19 +1203,6 @@ class ClientBot:
                 self.positions = state.get("positions", {})
                 self.protective_orders = state.get("protective_orders", {})
                 self.consecutive_losses = state.get("consecutive_losses", {})
-                # Restore persisted agent/gate state
-                self._last_loss_ts = state.get("last_loss_ts", {})
-                saved_skip = state.get("skip_until", {})
-                if saved_skip:
-                    now = time.time()
-                    # Only restore unexpired skips
-                    self._skip_until = {k: v for k, v in saved_skip.items() if v > now}
-                saved_paused = state.get("agent_paused", [])
-                if saved_paused:
-                    self._agent_paused = set(saved_paused)
-                for pos in self.positions.values():
-                    pos.setdefault("max_pnl_pct", 0.0)
-                    pos.setdefault("last_floor", -1.0)
                 if self.positions:
                     log.info(f"Loaded state: {len(self.positions)} tracked positions")
         except Exception as e:
@@ -1499,8 +1224,6 @@ class ClientBot:
                     "qty": p["qty"],
                     "entry_time": p["entry_time"],
                     "sl_price": self.protective_orders.get(sym, {}).get("sl_price", 0),
-                    "max_pnl_pct": round(p.get("max_pnl_pct", 0), 2),
-                    "floor_lock": p.get("last_floor", -1),
                 }
                 for sym, p in self.positions.items()
             },
