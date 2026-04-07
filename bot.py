@@ -503,12 +503,24 @@ class ClientBot:
             if ex_qty > 0 and ex_dir == signal_dir:
                 # Correct direction — ensure it's tracked locally
                 if not tracked:
+                    # Use signal_price as entry estimate; if unavailable, fetch from proxy
+                    entry_est = signal_price
+                    if entry_est <= 0:
+                        try:
+                            last_price = self.last_prices.get(symbol, 0)
+                            if last_price > 0:
+                                entry_est = last_price
+                            else:
+                                log.warning(f"  Sync: {symbol} has no valid price, skipping")
+                                continue
+                        except Exception:
+                            continue
                     log.info(f"  Sync: {symbol} on Binance matches signal, adding to local state")
                     dir_label = "LONG" if signal_dir == 1 else "SHORT"
                     self.positions[symbol] = {
                         "direction": signal_dir,
                         "qty": ex_qty,
-                        "entry_price": signal_price,
+                        "entry_price": entry_est,
                         "sl_price": 0,
                         "entry_time": datetime.now().isoformat(),
                         "max_pnl_pct": 0.0,
@@ -632,8 +644,10 @@ class ClientBot:
                 log.warning(f"Periodic sync failed: {e}")
 
     async def _poll_commands(self):
-        """Poll for pending commands every 30 seconds."""
+        """Poll for pending commands every 30 seconds.
+        Ignores commands older than 10 minutes to prevent stale queue issues after long outages."""
         http_url = SIGNAL_SERVER_URL.replace("wss://", "https://").replace("ws://", "http://")
+        COMMAND_TTL_SECONDS = 600  # 10 minutes — ignore older commands
         while self.running:
             try:
                 async with httpx.AsyncClient(timeout=10.0) as client:
@@ -644,6 +658,23 @@ class ClientBot:
                     if resp.status_code == 200:
                         data = resp.json()
                         if data.get("id") and data.get("command"):
+                            # Check command age — skip stale commands
+                            created = data.get("created_at", "")
+                            if created:
+                                try:
+                                    from datetime import datetime, timezone
+                                    cmd_time = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                                    age = (datetime.now(timezone.utc) - cmd_time).total_seconds()
+                                    if age > COMMAND_TTL_SECONDS:
+                                        log.warning(f"Skipping stale command #{data['id']} ({data['command']}) — {age/60:.0f}m old")
+                                        # Ack it to clear the queue
+                                        await client.post(
+                                            f"{http_url}/api/commands/{data['id']}/ack",
+                                            params={"key": self.signal_api_key},
+                                        )
+                                        continue
+                                except (ValueError, TypeError):
+                                    pass
                             await self._execute_command(data["id"], data["command"])
             except Exception as e:
                 log.error(f"Command poll failed: {e}")
