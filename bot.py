@@ -274,9 +274,10 @@ class BinanceProxy:
         return resp.json()
 
     async def cancel_all_orders(self, symbol: str):
-        """Cancel all open orders for a symbol."""
+        """Cancel all open orders for a symbol (regular + algo/conditional)."""
         bsym = binance_symbol(symbol)
-        # Get all open orders and cancel individually
+
+        # Cancel regular orders
         resp = await self.client.get(
             f"{PROXY_URL}/v1/openOrders",
             headers=self._headers(),
@@ -292,6 +293,16 @@ class BinanceProxy:
                         headers=self._headers(),
                         params={"symbol": bsym, "orderId": str(order_id)},
                     )
+
+        # Cancel algo/conditional orders (STOP_MARKET SL orders)
+        try:
+            await self.client.delete(
+                f"{PROXY_URL}/v1/allAlgoOrders",
+                headers=self._headers(),
+                params={"symbol": bsym},
+            )
+        except Exception as e:
+            log.warning(f"  {symbol}: failed to cancel algo orders: {e}")
 
     async def close(self):
         await self.client.aclose()
