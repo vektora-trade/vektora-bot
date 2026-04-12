@@ -208,6 +208,7 @@ class ComboBot:
         self.cfg = {**DEFAULT_CONFIG, **(config or {})}
         self.exchange = None
         self.running = True
+        self._start_time = time.time()
         self.positions = {}       # symbol -> {direction, qty, entry_price, entry_time, max_pnl_pct, last_floor}
         self.protective_orders = {}  # symbol -> {sl_order_id, tp_order_id, sl_price, tp_price}
         self._load_state()
@@ -724,6 +725,8 @@ class ComboBot:
         self._poll_commands()
         # AI exit management
         self._check_ai_exits()
+        # Report status to dashboard
+        self._report_status()
 
     def run(self, once=False):
         """Main loop."""
@@ -880,6 +883,55 @@ class ComboBot:
                     self.close_position(symbol)
         except Exception as e:
             log.error(f"AI exit check failed: {e}")
+
+    def _report_status(self):
+        """Report balance + positions to signal server for dashboard display."""
+        if not SIGNAL_SERVER_URL or not BOT_API_KEY:
+            return
+        try:
+            import requests
+            balance = self.exchange.fetch_balance()
+            total_equity = float(balance.get("total", {}).get("USDT", 0) or 0)
+
+            # Build position list from actual exchange data
+            raw_positions = balance.get("info", {}).get("positions", [])
+            pos_list = []
+            for p in raw_positions:
+                amt = float(p.get("positionAmt", 0) or 0)
+                if abs(amt) == 0:
+                    continue
+                sym_raw = p.get("symbol", "")
+                # Convert BTCUSDT -> BTC/USDT
+                sym_clean = sym_raw.replace("USDT", "/USDT") if "USDT" in sym_raw else sym_raw
+                direction = 1 if amt > 0 else -1
+                pnl_usd = float(p.get("unrealizedProfit", 0) or 0)
+                margin = float(p.get("initialMargin", 0) or 0)
+                notional = abs(float(p.get("notional", 0) or 0))
+                entry_price = notional / abs(amt) if abs(amt) > 0 else 0
+                pnl_pct = (pnl_usd / margin * 100) if margin > 0 else 0
+
+                pos_list.append({
+                    "symbol": sym_clean,
+                    "direction": direction,
+                    "entry_price": round(entry_price, 6),
+                    "pnl_usd": round(pnl_usd, 2),
+                    "pnl_pct": round(pnl_pct, 1),
+                })
+
+            payload = {
+                "balance": total_equity,
+                "positions": pos_list,
+                "uptime_seconds": int(time.time() - self._start_time),
+            }
+
+            requests.post(
+                f"{SIGNAL_SERVER_URL}/api/bot-status",
+                params={"key": BOT_API_KEY},
+                json=payload,
+                timeout=10,
+            )
+        except Exception as e:
+            log.error(f"Status report failed: {e}")
 
 
 # ──────────────────────────────────────────────────────────────
