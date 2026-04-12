@@ -47,8 +47,8 @@ try:
 except ImportError:
     pass
 
-SIGNAL_SERVER_URL = os.getenv("SIGNAL_SERVER_URL", "")
-BOT_API_KEY = os.getenv("BOT_API_KEY", "")
+SIGNAL_SERVER_URL = os.getenv("SIGNAL_SERVER_URL", "https://signal-server-production-1802.up.railway.app")
+BOT_API_KEY = os.getenv("BOT_API_KEY", "") or os.getenv("SIGNAL_API_KEY", "")
 
 # ──────────────────────────────────────────────────────────────
 # Logging
@@ -234,8 +234,8 @@ class ComboBot:
             self.exchange.set_sandbox_mode(True)
             log.info("Connected to Binance TESTNET")
         else:
-            api_key = os.getenv("BINANCE_APIKEY")
-            secret = os.getenv("BINANCE_SECRET")
+            api_key = os.getenv("BINANCE_APIKEY") or os.getenv("BINANCE_KEY", "")
+            secret = os.getenv("BINANCE_SECRET", "")
             if not api_key or not secret:
                 log.error("Set BINANCE_APIKEY and BINANCE_SECRET in .env")
                 return False
