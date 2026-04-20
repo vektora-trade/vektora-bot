@@ -1078,15 +1078,19 @@ class ClientBot:
                     if qty > 0:
                         pos_data = self.positions.get(symbol, {})
                         entry_price = pos_data.get("entry_price", 0)
-                        # Calculate unrealized P&L from current price (leveraged ROI)
+                        # pnl_pct is leveraged ROI for the dashboard. pnl_pct_raw
+                        # is unleveraged price-move %, used server-side by the
+                        # profit-lock check which operates in raw-price semantics.
                         pnl_usd = 0.0
                         pnl_pct = 0.0
+                        pnl_pct_raw = 0.0
                         if entry_price > 0:
                             current_price = self.last_prices.get(symbol, entry_price)
                             if direction == 1:
-                                pnl_pct = (current_price - entry_price) / entry_price * 100 * LEVERAGE
+                                pnl_pct_raw = (current_price - entry_price) / entry_price * 100
                             else:
-                                pnl_pct = (entry_price - current_price) / entry_price * 100 * LEVERAGE
+                                pnl_pct_raw = (entry_price - current_price) / entry_price * 100
+                            pnl_pct = pnl_pct_raw * LEVERAGE
                             notional = qty * entry_price
                             pnl_usd = (pnl_pct / 100) * notional  # notional already includes leverage
                         positions.append({
@@ -1095,6 +1099,7 @@ class ClientBot:
                             "entry_price": entry_price,
                             "pnl_usd": round(pnl_usd, 2),
                             "pnl_pct": round(pnl_pct, 2),
+                            "pnl_pct_raw": round(pnl_pct_raw, 3),
                         })
                 except Exception:
                     pass
