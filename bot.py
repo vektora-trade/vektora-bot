@@ -681,25 +681,41 @@ class ClientBot:
                                         continue
                                 except (ValueError, TypeError):
                                     pass
-                            await self._execute_command(data["id"], data["command"])
+                            await self._execute_command(data["id"], data["command"], data.get("payload") or {})
             except Exception as e:
                 log.error(f"Command poll failed: {e}")
             await asyncio.sleep(30)
 
-    async def _execute_command(self, cmd_id: int, command: str):
+    async def _execute_command(self, cmd_id: int, command: str, payload: dict | None = None):
         """Execute a bot command."""
-        log.info(f"Executing command: {command} (id={cmd_id})")
+        payload = payload or {}
+        log.info(f"Executing command: {command} (id={cmd_id}) payload={payload}")
         try:
             if command == "pause":
                 self.bot_state = "paused_holding"
+                self._save_state()
                 log.info("Bot paused (holding positions)")
             elif command == "pause_close_all":
                 self.bot_state = "paused_closed"
+                self._save_state()
                 await self._close_all_positions()
                 log.info("Bot paused (all positions closed)")
             elif command == "resume":
                 self.bot_state = "running"
+                self._save_state()
                 log.info("Bot resumed")
+            elif command == "close_symbol":
+                # Server-side close request (e.g. Profit Lock fallback when WS
+                # is unavailable). Close just the named symbol via the same
+                # path used for signal-driven closes so the trade reports back.
+                symbol = payload.get("symbol", "")
+                reason = payload.get("reason", "server_close")
+                pos = self.positions.get(symbol)
+                if pos:
+                    log.info(f"Closing {symbol} on server request (reason={reason})")
+                    await self._close_position(symbol, pos.get("entry_price", 0), reason)
+                else:
+                    log.warning(f"close_symbol: {symbol} not tracked locally, ignoring")
 
             # Acknowledge command
             http_url = SIGNAL_SERVER_URL.replace("wss://", "https://").replace("ws://", "http://")
