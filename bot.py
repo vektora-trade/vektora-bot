@@ -492,8 +492,23 @@ class ClientBot:
             if ex_qty > 0 and ex_dir == signal_dir:
                 # Correct direction — re-place the SL that _cleanup_orphaned_orders wiped,
                 # then ensure it's tracked locally.
+                # Determine the SL: trail UP only, never below the entry floor.
+                # Floor = entry × 0.92 (for LONG) / entry × 1.08 (for SHORT). This
+                # caps the worst case at the original -8% risk on the trade. The
+                # trailing leg can move SL closer to current price as the position
+                # gains, but never widens the risk below the original floor.
                 sl_pct = SL_PCT / 100
-                new_sl = signal_price * (1 - sl_pct) if signal_dir == 1 else signal_price * (1 + sl_pct)
+                entry_est = (tracked or {}).get("entry_price", 0) or signal_price
+                if entry_est <= 0:
+                    entry_est = self.last_prices.get(symbol, 0) or signal_price
+                if signal_dir == 1:
+                    floor_sl = entry_est * (1 - sl_pct)
+                    trail_sl = signal_price * (1 - sl_pct)
+                    new_sl = max(floor_sl, trail_sl)
+                else:
+                    floor_sl = entry_est * (1 + sl_pct)
+                    trail_sl = signal_price * (1 + sl_pct)
+                    new_sl = min(floor_sl, trail_sl)
                 new_sl = _round_price(symbol, new_sl)
                 close_side = "SELL" if signal_dir == 1 else "BUY"
                 sl_placed = False
@@ -501,16 +516,17 @@ class ClientBot:
                     await self.proxy.place_stop_market(symbol, close_side, ex_qty, new_sl)
                     self.protective_orders[symbol] = {"sl_price": new_sl}
                     sl_placed = True
-                    log.info(f"  Sync: {symbol} SL re-placed @ ${new_sl:.4f}")
+                    log.info(f"  Sync: {symbol} SL re-placed @ ${new_sl:.4f} (entry ${entry_est:.4f}, floor ${floor_sl:.4f}, trail ${trail_sl:.4f})")
                 except Exception as e:
                     log.error(f"  Sync: SL re-place FAILED for {symbol} — position is UNPROTECTED: {e}")
 
-                entry_est = (tracked or {}).get("entry_price", 0) or signal_price
-                if entry_est <= 0:
-                    entry_est = self.last_prices.get(symbol, 0) or signal_price
                 if tracked:
                     tracked["qty"] = ex_qty
                     tracked["sl_price"] = new_sl if sl_placed else 0
+                    # Repair corrupt entry_price = 0 in legacy state.
+                    if tracked.get("entry_price", 0) <= 0:
+                        tracked["entry_price"] = entry_est
+                        log.warning(f"  Sync: {symbol} had corrupt entry_price=0; repaired to ${entry_est:.4f}")
                 else:
                     dir_label = "LONG" if signal_dir == 1 else "SHORT"
                     log.info(f"  Sync: {symbol} on Binance matches signal, adding to local state")
@@ -554,22 +570,23 @@ class ClientBot:
                 fixed += 1
 
             elif ex_qty == 0 and tracked:
-                # Bot thinks it has a position but Binance doesn't — clean up
-                log.warning(f"  Sync: {symbol} tracked locally but not on Binance — cleaning up")
+                # Bot thinks it has a position but Binance doesn't — clean up.
+                # Likely an SL trigger or external close. Log it so the user can
+                # reconcile realized P&L manually (we don't have the exit price here).
+                log.warning(
+                    f"  Sync: {symbol} tracked locally (entry ${tracked.get('entry_price', 0):.4f}) "
+                    f"but not on Binance — likely SL-triggered close. Cleaning up local state."
+                )
                 self.positions.pop(symbol, None)
                 self.protective_orders.pop(symbol, None)
 
             elif ex_qty == 0 and not tracked:
-                # NO POSITION — open in signal direction (if under max positions)
-                if len(self.positions) >= MAX_POSITIONS:
-                    continue
-                dir_label = "LONG" if signal_dir == 1 else "SHORT"
-                log.info(f"  Sync: {symbol} has no position, signal says {dir_label} — opening")
-                sl_pct = SL_PCT / 100
-                new_sl = signal_price * (1 - sl_pct) if signal_dir == 1 else signal_price * (1 + sl_pct)
-                new_sl = _round_price(symbol, new_sl)
-                await self._open_position(symbol, signal_dir, signal_price, new_sl)
-                fixed += 1
+                # NO POSITION and not tracked locally. Sync does NOT auto-open here —
+                # entries only happen on real signal flips received via WS. This
+                # prevents the bot from filling up the book on startup or after a
+                # manual close, which historically caused entry_price=0 corruption
+                # and unintended re-entries after user intervention.
+                pass
 
         self._save_state()
         self._syncing = False
@@ -916,7 +933,24 @@ class ClientBot:
             # Market entry
             side = "BUY" if direction == 1 else "SELL"
             order = await self.proxy.place_market_order(symbol, side, qty)
-            fill_price = float(order.get("avgPrice", price) or price)
+            # Binance may return avgPrice as the string "0.00000" for market orders
+            # that haven't computed the average yet. Convert to float FIRST, then
+            # fall back to signal price if the value is non-positive — the previous
+            # `or price` short-circuit failed because "0.00000" is truthy.
+            try:
+                fill_price = float(order.get("avgPrice") or 0)
+            except (TypeError, ValueError):
+                fill_price = 0.0
+            if fill_price <= 0:
+                fill_price = price
+            if fill_price <= 0:
+                log.error(f"  {symbol}: no usable fill price; emergency closing")
+                close_side = "SELL" if direction == 1 else "BUY"
+                try:
+                    await self.proxy.place_market_order(symbol, close_side, qty)
+                except Exception as e:
+                    log.error(f"  EMERGENCY CLOSE FAILED: {e}")
+                return
             price = fill_price
             log.info(f"  OPENED {symbol}: {side} {qty} @ ${fill_price:.4f}")
 
@@ -1243,6 +1277,7 @@ class ClientBot:
                     "protective_orders": self.protective_orders,
                     "session_pnl": self.session_pnl,
                     "consecutive_losses": self.consecutive_losses,
+                    "bot_state": self.bot_state,
                     "updated": datetime.now().isoformat(),
                 }, f, indent=2)
         except Exception as e:
@@ -1256,6 +1291,10 @@ class ClientBot:
                 self.positions = state.get("positions", {})
                 self.protective_orders = state.get("protective_orders", {})
                 self.consecutive_losses = state.get("consecutive_losses", {})
+                saved_bot_state = state.get("bot_state")
+                if saved_bot_state in ("running", "paused_holding", "paused_closed"):
+                    self.bot_state = saved_bot_state
+                    log.info(f"Loaded bot_state: {self.bot_state}")
                 if self.positions:
                     log.info(f"Loaded state: {len(self.positions)} tracked positions")
         except Exception as e:
