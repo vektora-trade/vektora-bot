@@ -658,10 +658,14 @@ class ClientBot:
                 log.warning(f"  Sync: {symbol} has invalid price ({signal_price}), skipping")
                 continue
 
-            # Get Binance position
-            ex_qty, ex_dir = await self.proxy.get_position(symbol)
-            if ex_qty < 0:
+            # Get Binance position. entryPrice from Binance is the source of
+            # truth for the entry — the local cache can be wrong after a restart.
+            info = await self.proxy.get_position_info(symbol)
+            if info is None:
                 continue  # API error, skip
+            ex_qty = info["qty"]
+            ex_dir = info["direction"]
+            ex_entry = info["entry_price"]
 
             tracked = self.positions.get(symbol)
 
@@ -673,7 +677,11 @@ class ClientBot:
                 # trailing leg can move SL closer to current price as the position
                 # gains, but never widens the risk below the original floor.
                 sl_pct = SL_PCT / 100
-                entry_est = (tracked or {}).get("entry_price", 0) or signal_price
+                # Entry price: Binance entryPrice is authoritative. Never fall
+                # back to the signal price when Binance gives a real value —
+                # that is exactly what corrupted the dashboard P&L (a fallen
+                # long looked profitable against a too-recent fake entry).
+                entry_est = ex_entry if ex_entry > 0 else (tracked or {}).get("entry_price", 0)
                 if entry_est <= 0:
                     entry_est = self.last_prices.get(symbol, 0) or signal_price
                 if signal_dir == 1:
@@ -711,10 +719,13 @@ class ClientBot:
                 if tracked:
                     tracked["qty"] = ex_qty
                     tracked["sl_price"] = new_sl if sl_placed else 0
-                    # Repair corrupt entry_price = 0 in legacy state.
-                    if tracked.get("entry_price", 0) <= 0:
-                        tracked["entry_price"] = entry_est
-                        log.warning(f"  Sync: {symbol} had corrupt entry_price=0; repaired to ${entry_est:.4f}")
+                    # Keep local entry_price aligned with Binance's actual fill.
+                    # Repairs both corrupt (0) and stale/wrong entries.
+                    if ex_entry > 0 and abs(tracked.get("entry_price", 0) - ex_entry) > ex_entry * 0.001:
+                        old_ep = tracked.get("entry_price", 0)
+                        tracked["entry_price"] = ex_entry
+                        log.warning(f"  Sync: {symbol} entry_price corrected "
+                                    f"${old_ep:.4f} → ${ex_entry:.4f} (from Binance)")
                 else:
                     dir_label = "LONG" if signal_dir == 1 else "SHORT"
                     log.info(f"  Sync: {symbol} on Binance matches signal, adding to local state")
@@ -1313,10 +1324,20 @@ class ClientBot:
             positions = []
             for symbol in self.active_symbols:
                 try:
-                    qty, direction = await self.proxy.get_position(symbol)
-                    if qty > 0:
-                        pos_data = self.positions.get(symbol, {})
-                        entry_price = pos_data.get("entry_price", 0)
+                    info = await self.proxy.get_position_info(symbol)
+                    if info and info["qty"] > 0:
+                        qty = info["qty"]
+                        direction = info["direction"]
+                        # Binance entryPrice is the source of truth. The local
+                        # tracked entry can be stale/wrong after a restart, which
+                        # corrupts the reported P&L. Use Binance's value and
+                        # repair the local cache so close-P&L is correct too.
+                        entry_price = info["entry_price"]
+                        pos_data = self.positions.get(symbol)
+                        if entry_price <= 0:
+                            entry_price = (pos_data or {}).get("entry_price", 0)
+                        elif pos_data and abs(pos_data.get("entry_price", 0) - entry_price) > entry_price * 0.001:
+                            pos_data["entry_price"] = entry_price
                         # pnl_pct is leveraged ROI for the dashboard. pnl_pct_raw
                         # is unleveraged price-move %, used server-side by the
                         # profit-lock check which operates in raw-price semantics.
