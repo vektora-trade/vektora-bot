@@ -111,6 +111,20 @@ class TelegramAlerts:
             f"Balance: ${balance:,.2f}"
         )
 
+    async def position_unprotected(self, symbol: str, detail: str = ""):
+        """Critical: an open position has no stop-loss and one could not be placed."""
+        body = f"⚠️ <b>{symbol} UNPROTECTED</b>\nStop-loss could not be placed."
+        if detail:
+            body += f"\n{detail}"
+        await self._send(body)
+
+    async def sl_restored(self, symbol: str, sl_price: float):
+        """A position was found without a stop-loss and one was re-placed."""
+        await self._send(
+            f"\U0001f6e1️ <b>{symbol} SL restored</b>\n"
+            f"Stop-loss was missing — re-placed @ ${sl_price:,.4f}"
+        )
+
 START_TIME = time.time()
 
 
@@ -304,6 +318,68 @@ class BinanceProxy:
         except Exception as e:
             log.warning(f"  {symbol}: failed to cancel algo orders: {e}")
 
+    async def get_position_info(self, symbol: str) -> dict | None:
+        """Full position info from Binance: {qty, direction, entry_price}.
+        qty=0 means flat. Returns None on API error so callers never act on
+        uncertain state."""
+        bsym = binance_symbol(symbol)
+        try:
+            resp = await self.client.get(
+                f"{PROXY_URL}/v1/position",
+                headers=self._headers(),
+                params={"symbol": bsym},
+            )
+        except Exception as e:
+            log.error(f"get_position_info({symbol}) network error: {e}")
+            return None
+        if resp.status_code != 200:
+            log.error(f"get_position_info({symbol}) HTTP {resp.status_code}")
+            return None
+        data = resp.json()
+        for pos in data:
+            if pos.get("symbol") == bsym:
+                amt = float(pos.get("positionAmt", 0) or 0)
+                if abs(amt) > 0:
+                    return {
+                        "qty": abs(amt),
+                        "direction": 1 if amt > 0 else -1,
+                        "entry_price": float(pos.get("entryPrice", 0) or 0),
+                    }
+        return {"qty": 0.0, "direction": 0, "entry_price": 0.0}
+
+    async def get_open_algo_orders(self, symbol: str) -> list | None:
+        """List open algo/conditional orders (STOP_MARKET SLs) for a symbol.
+        Returns None on API error so callers can tell 'unknown' from 'none'."""
+        bsym = binance_symbol(symbol)
+        try:
+            resp = await self.client.get(
+                f"{PROXY_URL}/v1/openAlgoOrders",
+                headers=self._headers(),
+                params={"symbol": bsym},
+            )
+        except Exception as e:
+            log.error(f"get_open_algo_orders({symbol}) network error: {e}")
+            return None
+        if resp.status_code != 200:
+            log.error(f"get_open_algo_orders({symbol}) HTTP {resp.status_code}")
+            return None
+        data = resp.json()
+        return data if isinstance(data, list) else []
+
+    async def cancel_algo_order(self, symbol: str, algo_id) -> None:
+        """Cancel a single algo order by algoId (DELETE with JSON body)."""
+        try:
+            resp = await self.client.request(
+                "DELETE",
+                f"{PROXY_URL}/v1/algoOrder",
+                headers=self._headers(),
+                json={"algoId": str(algo_id)},
+            )
+            if resp.status_code != 200:
+                log.warning(f"  {symbol}: cancel algo {algo_id} -> HTTP {resp.status_code}")
+        except Exception as e:
+            log.warning(f"  {symbol}: cancel algo {algo_id} failed: {e}")
+
     async def close(self):
         await self.client.aclose()
 
@@ -393,27 +469,93 @@ class ClientBot:
             await asyncio.sleep(300)
             await self._fetch_symbols()
 
-    async def _cleanup_orphaned_orders(self):
-        """Cancel ALL conditional orders across all symbols on startup.
-        Prevents orphaned SL orders from accumulating across restarts."""
+    async def _reconcile_protection(self):
+        """Guarantee every open Binance position has a stop-loss order, and
+        clean up orphaned conditional orders on flat symbols.
+
+        Depends ONLY on the proxy / Binance — never on the signal server — so a
+        signal-server outage can never strip a position of its protection.
+        For an unprotected position it places the 8% floor SL straight off the
+        Binance entry price. Safe to run while the bot is paused.
+        """
         if not self.proxy:
             return
-        log.info("Cleanup: cancelling all conditional orders across all symbols...")
-        cancelled = 0
+        sl_pct = SL_PCT / 100
+        protected = 0
+        restored = 0
         for symbol in SYMBOLS:
             symbol = normalize_symbol(symbol)
+            info = await self.proxy.get_position_info(symbol)
+            if info is None:
+                continue  # API error — never cancel/replace on uncertain state
+
+            if info["qty"] <= 0:
+                # Flat — cancel any orphaned conditional orders for this symbol.
+                algo = await self.proxy.get_open_algo_orders(symbol)
+                if algo:  # non-empty list of leftover orders
+                    try:
+                        await self.proxy.cancel_all_orders(symbol)
+                        log.info(f"  Reconcile: cleared {len(algo)} orphaned order(s) for {symbol}")
+                    except Exception as e:
+                        log.warning(f"  Reconcile: orphan cleanup failed for {symbol}: {e}")
+                continue
+
+            # Position is OPEN — make sure a stop-loss exists.
+            algo = await self.proxy.get_open_algo_orders(symbol)
+            # The bot only ever places STOP_MARKET SL algo orders, so any open
+            # algo order on a position-bearing symbol IS the stop-loss. On an
+            # API error (None) treat it as missing — a duplicate reduceOnly STOP
+            # is harmless, a naked position is not.
+            has_sl = bool(algo)
+            if has_sl:
+                protected += 1
+                continue
+
+            direction = info["direction"]
+            entry = info["entry_price"]
+            if entry <= 0:
+                entry = (self.positions.get(symbol) or {}).get("entry_price", 0) \
+                    or self.last_prices.get(symbol, 0)
+            if entry <= 0:
+                log.error(f"  Reconcile: {symbol} OPEN but no entry price — cannot place SL")
+                await self.alerts.position_unprotected(symbol, "No entry price available.")
+                continue
+
+            if direction == 1:
+                new_sl = _round_price(symbol, entry * (1 - sl_pct))
+                close_side = "SELL"
+            else:
+                new_sl = _round_price(symbol, entry * (1 + sl_pct))
+                close_side = "BUY"
             try:
-                await self.proxy.cancel_all_orders(symbol)
-                cancelled += 1
+                await self.proxy.place_stop_market(symbol, close_side, info["qty"], new_sl)
+                self.protective_orders[symbol] = {"sl_price": new_sl}
+                restored += 1
+                log.warning(f"  Reconcile: {symbol} was UNPROTECTED — SL placed @ "
+                            f"${new_sl:.4f} (entry ${entry:.4f})")
+                await self.alerts.sl_restored(symbol, new_sl)
             except Exception as e:
-                log.warning(f"Cleanup: failed to cancel orders for {symbol}: {e}")
-        log.info(f"Cleanup: cancelled orders for {cancelled} symbols")
+                log.error(f"  Reconcile: SL placement FAILED for {symbol} — "
+                          f"position is UNPROTECTED: {e}")
+                await self.alerts.position_unprotected(symbol, str(e)[:120])
+        log.info(f"Reconcile: {protected} already protected, {restored} SL re-placed")
+
+    async def _protection_guard_loop(self):
+        """Independent safety net: every 3 minutes verify all open positions
+        still have a stop-loss and re-place any that are missing. Runs even
+        when the bot is paused and needs only the proxy."""
+        while self.running:
+            await asyncio.sleep(180)
+            try:
+                await self._reconcile_protection()
+            except Exception as e:
+                log.warning(f"Protection guard failed: {e}")
 
     async def _sync_positions_with_signals(self):
         """Sync Binance positions with signal server directions on startup.
 
         Checks every active symbol against the signal server snapshot:
-        0. Cancel ALL orphaned conditional orders first
+        0. Reconcile protection — ensure every open position has a stop-loss
         1. Wrong direction on Binance → close and reopen correctly
         2. Missing position (flat but signal is active) → open position
         3. Stale local state (tracked but not on Binance) → clean up
@@ -428,14 +570,20 @@ class ClientBot:
 
         self._syncing = True
 
-        # If bot is paused, don't sync — it would reopen positions
+        # Step 0: Guarantee every open position has a stop-loss. This runs
+        # BEFORE the pause check and BEFORE any signal-server call, so neither
+        # a paused bot nor a signal-server outage can leave a position naked.
+        try:
+            await self._reconcile_protection()
+        except Exception as e:
+            log.error(f"Sync: protection reconcile failed: {e}")
+
+        # If bot is paused, don't sync directions — it would reopen positions.
         if self.bot_state != "running":
-            log.info(f"Sync: skipping — bot is {self.bot_state}")
+            log.info(f"Sync: skipping direction sync — bot is {self.bot_state}")
             self._syncing = False
             return
 
-        # Step 0: Cancel all orphaned orders before sync
-        await self._cleanup_orphaned_orders()
         http_url = SIGNAL_SERVER_URL.replace("wss://", "https://").replace("ws://", "http://")
 
         # Fetch current signal directions from server snapshot
@@ -490,8 +638,7 @@ class ClientBot:
             tracked = self.positions.get(symbol)
 
             if ex_qty > 0 and ex_dir == signal_dir:
-                # Correct direction — re-place the SL that _cleanup_orphaned_orders wiped,
-                # then ensure it's tracked locally.
+                # Correct direction — ensure the SL is in place and trailed.
                 # Determine the SL: trail UP only, never below the entry floor.
                 # Floor = entry × 0.92 (for LONG) / entry × 1.08 (for SHORT). This
                 # caps the worst case at the original -8% risk on the trade. The
@@ -511,14 +658,27 @@ class ClientBot:
                     new_sl = min(floor_sl, trail_sl)
                 new_sl = _round_price(symbol, new_sl)
                 close_side = "SELL" if signal_dir == 1 else "BUY"
+                # Place the new SL FIRST, then cancel the superseded ones. The
+                # position is never left without a stop-loss, even for a moment
+                # (the opposite of the old cancel-then-replace ordering that
+                # left positions naked when the re-place failed). Snapshot the
+                # existing algo orders so we cancel exactly those, not the new one.
+                old_algo = await self.proxy.get_open_algo_orders(symbol)
                 sl_placed = False
                 try:
                     await self.proxy.place_stop_market(symbol, close_side, ex_qty, new_sl)
                     self.protective_orders[symbol] = {"sl_price": new_sl}
                     sl_placed = True
-                    log.info(f"  Sync: {symbol} SL re-placed @ ${new_sl:.4f} (entry ${entry_est:.4f}, floor ${floor_sl:.4f}, trail ${trail_sl:.4f})")
+                    log.info(f"  Sync: {symbol} SL set @ ${new_sl:.4f} (entry ${entry_est:.4f}, floor ${floor_sl:.4f}, trail ${trail_sl:.4f})")
                 except Exception as e:
-                    log.error(f"  Sync: SL re-place FAILED for {symbol} — position is UNPROTECTED: {e}")
+                    log.error(f"  Sync: SL placement FAILED for {symbol} — position is UNPROTECTED: {e}")
+                    await self.alerts.position_unprotected(symbol, str(e)[:120])
+                if sl_placed and old_algo:
+                    # New SL is live — remove the superseded order(s).
+                    for o in old_algo:
+                        aid = o.get("algoId") or o.get("orderId")
+                        if aid:
+                            await self.proxy.cancel_algo_order(symbol, aid)
 
                 if tracked:
                     tracked["qty"] = ex_qty
@@ -636,6 +796,7 @@ class ClientBot:
         self._symbol_refresh_task = asyncio.create_task(self._symbol_refresh_loop())
         self._periodic_sync_task = asyncio.create_task(self._periodic_sync_loop())
         self._command_poll_task = asyncio.create_task(self._poll_commands())
+        self._protection_guard_task = asyncio.create_task(self._protection_guard_loop())
 
         log.info("Bot started")
 
