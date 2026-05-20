@@ -364,7 +364,13 @@ class BinanceProxy:
             log.error(f"get_open_algo_orders({symbol}) HTTP {resp.status_code}")
             return None
         data = resp.json()
-        return data if isinstance(data, list) else []
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            # Some Binance algo endpoints wrap the list in an object.
+            orders = data.get("orders") or data.get("data") or []
+            return orders if isinstance(orders, list) else []
+        return []
 
     async def cancel_algo_order(self, symbol: str, algo_id) -> None:
         """Cancel a single algo order by algoId (DELETE with JSON body)."""
@@ -500,14 +506,34 @@ class ClientBot:
                         log.warning(f"  Reconcile: orphan cleanup failed for {symbol}: {e}")
                 continue
 
-            # Position is OPEN — make sure a stop-loss exists.
-            algo = await self.proxy.get_open_algo_orders(symbol)
+            # Position is OPEN — make sure EXACTLY ONE stop-loss exists.
             # The bot only ever places STOP_MARKET SL algo orders, so any open
-            # algo order on a position-bearing symbol IS the stop-loss. On an
-            # API error (None) treat it as missing — a duplicate reduceOnly STOP
-            # is harmless, a naked position is not.
-            has_sl = bool(algo)
-            if has_sl:
+            # algo order on a position-bearing symbol IS a stop-loss.
+            algo = await self.proxy.get_open_algo_orders(symbol)
+            need_sl = False
+            if algo is None:
+                # Query failed — do NOT place a blind duplicate. Trust local
+                # state: if we have a recorded SL for this symbol, assume it
+                # still holds and retry the check next cycle. Only place when
+                # there is also no local record (position is probably naked).
+                if self.protective_orders.get(symbol):
+                    protected += 1
+                    continue
+                log.warning(f"  Reconcile: {symbol} algo-order query failed and no "
+                            f"local SL record — placing an SL to be safe")
+                need_sl = True
+            elif len(algo) == 0:
+                need_sl = True
+            elif len(algo) > 1:
+                # Duplicate SLs accumulated (earlier failed queries). Keep one,
+                # cancel the rest — every order is reduceOnly so this is safe.
+                for o in algo[1:]:
+                    aid = o.get("algoId") or o.get("orderId")
+                    if aid:
+                        await self.proxy.cancel_algo_order(symbol, aid)
+                log.info(f"  Reconcile: {symbol} had {len(algo)} SL orders — "
+                         f"cancelled {len(algo) - 1} duplicate(s)")
+            if not need_sl:
                 protected += 1
                 continue
 
@@ -546,6 +572,8 @@ class ClientBot:
         when the bot is paused and needs only the proxy."""
         while self.running:
             await asyncio.sleep(180)
+            if self._syncing:
+                continue  # a sync pass is already reconciling — avoid races
             try:
                 await self._reconcile_protection()
             except Exception as e:
