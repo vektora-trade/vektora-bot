@@ -46,7 +46,7 @@ SYMBOLS = [
     "BNB/USDT", "ETH/USDT", "BTC/USDT", "DOT/USDT", "LINK/USDT",
     "SAND/USDT", "XLM/USDT", "LTC/USDT",
 ]
-LEVERAGE = 10
+LEVERAGE = 5
 SL_PCT = 8.0
 RISK_PER_TRADE_PCT = 5.0
 MAX_POSITIONS = 5
@@ -1383,6 +1383,7 @@ class ClientBot:
 
             payload = {
                 "balance": round(balance, 2),
+                "leverage": LEVERAGE,
                 "positions": positions,
                 "recent_trades": recent,
                 "uptime_seconds": int(time.time() - START_TIME),
