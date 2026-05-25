@@ -402,6 +402,10 @@ class ClientBot:
         self.positions: dict = {}
         self.protective_orders: dict = {}
         self.active_symbols: list[str] = list(SYMBOLS)
+        # User-controlled, fetched from /api/settings (the module constants are
+        # only defaults / fallbacks if the server is unreachable).
+        self.max_positions: int = MAX_POSITIONS
+        self.leverage: int = LEVERAGE
         self._syncing = False
         self.bot_state = "running"  # running, paused_holding, paused_closed
         self.last_prices: dict[str, float] = {}
@@ -469,11 +473,50 @@ class ClientBot:
         except Exception as e:
             log.warning(f"Failed to fetch symbols: {e}")
 
+    async def _fetch_settings(self):
+        """Fetch user strategy settings (max_positions, leverage) from the
+        signal server. Leverage and max positions are user-controlled from the
+        dashboard — the onus is on the user. Re-applies Binance leverage when
+        it changes. Falls back to current values on any error."""
+        if not self.signal_api_key:
+            return
+        http_url = SIGNAL_SERVER_URL.replace("wss://", "https://").replace("ws://", "http://")
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    f"{http_url}/api/settings",
+                    params={"key": self.signal_api_key},
+                )
+            if resp.status_code != 200:
+                log.warning(f"Failed to fetch settings: {resp.status_code}")
+                return
+            data = resp.json()
+        except Exception as e:
+            log.warning(f"Failed to fetch settings: {e}")
+            return
+
+        new_max = data.get("max_positions")
+        if isinstance(new_max, int) and 1 <= new_max <= 18 and new_max != self.max_positions:
+            log.info(f"Max positions updated: {self.max_positions} -> {new_max}")
+            self.max_positions = new_max
+
+        new_lev = data.get("leverage")
+        if isinstance(new_lev, int) and 1 <= new_lev <= 20 and new_lev != self.leverage:
+            log.info(f"Leverage updated: {self.leverage}x -> {new_lev}x — re-applying on exchange")
+            self.leverage = new_lev
+            if self.proxy:
+                for symbol in SYMBOLS:
+                    try:
+                        await self.proxy.set_leverage(symbol, new_lev)
+                    except Exception as e:
+                        log.warning(f"  set_leverage {symbol} -> {new_lev}x failed: {e}")
+
     async def _symbol_refresh_loop(self):
-        """Re-fetch symbol preferences every 5 minutes."""
+        """Re-fetch symbol preferences and strategy settings every 5 minutes."""
         while self.running:
             await asyncio.sleep(300)
             await self._fetch_symbols()
+            await self._fetch_settings()
 
     async def _reconcile_protection(self):
         """Guarantee every open Binance position has a stop-loss order, and
@@ -805,6 +848,7 @@ class ClientBot:
             raise ValueError("Proxy config unavailable — check signal API key")
         self.proxy = BinanceProxy(binance_api_key, binance_secret, testnet)
         await self._fetch_symbols()
+        await self._fetch_settings()
 
         # Save credentials to persistent volume
         os.makedirs(DATA_DIR, exist_ok=True)
@@ -817,9 +861,10 @@ class ClientBot:
             }, f)
         os.chmod(CREDS_FILE, stat.S_IRUSR | stat.S_IWUSR)
 
-        # Setup leverage + margin mode
+        # Setup leverage + margin mode (uses the user-configured leverage
+        # fetched above; falls back to the module default).
         for symbol in SYMBOLS:
-            await self.proxy.set_leverage(symbol, LEVERAGE)
+            await self.proxy.set_leverage(symbol, self.leverage)
             await self.proxy.set_margin_type(symbol)
 
         self._load_state()
@@ -916,6 +961,11 @@ class ClientBot:
                     await self._close_position(symbol, pos.get("entry_price", 0), reason)
                 else:
                     log.warning(f"close_symbol: {symbol} not tracked locally, ignoring")
+            elif command in ("set_config", "set_max_positions"):
+                # Strategy settings changed on the dashboard — pull them now
+                # rather than waiting for the 5-min refresh. _fetch_settings
+                # re-applies leverage on the exchange if it changed.
+                await self._fetch_settings()
 
             # Acknowledge command
             http_url = SIGNAL_SERVER_URL.replace("wss://", "https://").replace("ws://", "http://")
@@ -1115,8 +1165,8 @@ class ClientBot:
 
     async def _open_position(self, symbol: str, direction: int, price: float, sl_price: float):
         """Open a new position via the proxy."""
-        if len(self.positions) >= MAX_POSITIONS:
-            log.warning(f"  Max positions ({MAX_POSITIONS}) reached, skipping {symbol}")
+        if len(self.positions) >= self.max_positions:
+            log.warning(f"  Max positions ({self.max_positions}) reached, skipping {symbol}")
             return
 
         if not self.proxy:
@@ -1135,7 +1185,7 @@ class ClientBot:
                 return
 
             allocation = balance * (RISK_PER_TRADE_PCT / 100)
-            notional = allocation * LEVERAGE
+            notional = allocation * self.leverage
             raw_qty = notional / price
             # Round quantity to Binance's required precision per symbol
             qty = _round_qty(symbol, raw_qty)
@@ -1266,7 +1316,7 @@ class ClientBot:
         else:
             pnl_pct = (entry_price - close_price) / entry_price * 100
 
-        roi_pct = pnl_pct * LEVERAGE
+        roi_pct = pnl_pct * self.leverage
         notional = pos["qty"] * entry_price
         pnl_dollar = (pnl_pct / 100) * notional
 
@@ -1350,7 +1400,7 @@ class ClientBot:
                                 pnl_pct_raw = (current_price - entry_price) / entry_price * 100
                             else:
                                 pnl_pct_raw = (entry_price - current_price) / entry_price * 100
-                            pnl_pct = pnl_pct_raw * LEVERAGE
+                            pnl_pct = pnl_pct_raw * self.leverage
                             notional = qty * entry_price
                             pnl_usd = (pnl_pct / 100) * notional  # notional already includes leverage
                         positions.append({
@@ -1383,7 +1433,7 @@ class ClientBot:
 
             payload = {
                 "balance": round(balance, 2),
-                "leverage": LEVERAGE,
+                "leverage": self.leverage,
                 "positions": positions,
                 "recent_trades": recent,
                 "uptime_seconds": int(time.time() - START_TIME),
