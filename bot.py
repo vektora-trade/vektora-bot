@@ -414,6 +414,10 @@ class ClientBot:
         self._ws_task: asyncio.Task | None = None
         self.alerts = TelegramAlerts()
         self._events: list[dict] = []
+        # Last successful wallet balance fetch. Used as a fallback in
+        # _report_status so a transient proxy failure never reports
+        # balance=0 (which polluted customer_equity_curve with $0 spikes).
+        self._last_known_balance: float | None = None
 
     def _log_event(self, event_type: str, symbol: str, message: str):
         """Log a bot activity event for the dashboard."""
@@ -1414,8 +1418,11 @@ class ClientBot:
                 except Exception:
                     pass
 
-            # Get total wallet balance (includes unrealized P&L)
-            balance = 0
+            # Get total wallet balance (includes unrealized P&L).
+            # On fetch failure, fall back to the last known balance so we
+            # don't pollute the equity curve with $0 spikes. If we've never
+            # had a successful fetch, skip reporting this cycle entirely.
+            balance: float | None = None
             try:
                 resp = await self.proxy.client.get(
                     f"{PROXY_URL}/v1/balance", headers=self.proxy._headers()
@@ -1427,6 +1434,15 @@ class ClientBot:
                             break
             except Exception:
                 pass
+
+            if balance is None:
+                if self._last_known_balance is None:
+                    log.warning("Status report: no balance available (first fetch failed) — skipping report")
+                    return
+                balance = self._last_known_balance
+                log.warning(f"Status report: balance fetch failed, using cached ${balance:.2f}")
+            else:
+                self._last_known_balance = balance
 
             # Recent trades (last 20)
             recent = self._get_recent_trades(20)
