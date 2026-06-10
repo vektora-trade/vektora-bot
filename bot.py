@@ -1663,7 +1663,28 @@ async def lifespan(_app: FastAPI):
             pass
         await bot._start()
 
+    # Dead-man heartbeat: ping healthchecks.io every cycle so an outage (platform
+    # down, crash past restart cap, or a hung event loop) alerts within minutes.
+    # No-op unless HEALTHCHECK_URL_BOT is set. Pings ".../fail" when the bot is
+    # alive but NOT running, so "alive-but-not-trading" alerts too.
+    async def _heartbeat_loop():
+        url = os.environ.get("HEALTHCHECK_URL_BOT", "")
+        if not url:
+            return
+        while True:
+            try:
+                target = url if bot.status == "running" else url.rstrip("/") + "/fail"
+                async with httpx.AsyncClient(timeout=5.0) as c:
+                    await c.get(target)
+            except Exception:
+                pass
+            await asyncio.sleep(60)
+
+    _hb_task = asyncio.create_task(_heartbeat_loop())
+
     yield
+
+    _hb_task.cancel()
 
 
 app.router.lifespan_context = lifespan
